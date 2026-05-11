@@ -63,6 +63,9 @@ impl NetworkClient {
             allocatedTokens
             tokenCapacity
             availableStake
+            rewardsEarned
+            queryFeesCollected
+            delegationExchangeRate
           }
         }"#, Some(json!({ "id": self.indexer_address.to_lowercase() }))).await?;
 
@@ -73,6 +76,10 @@ impl NetworkClient {
             allocated: Grt::from_wei(i["allocatedTokens"].as_str().unwrap_or("0")),
             capacity: Grt::from_wei(i["tokenCapacity"].as_str().unwrap_or("0")),
             available: Grt::from_wei(i["availableStake"].as_str().unwrap_or("0")),
+            rewards_earned: Grt::from_wei(i["rewardsEarned"].as_str().unwrap_or("0")),
+            query_fees: Grt::from_wei(i["queryFeesCollected"].as_str().unwrap_or("0")),
+            delegation_exchange_rate: i["delegationExchangeRate"].as_str()
+                .and_then(|s| s.parse::<f64>().ok()).unwrap_or(1.0),
         })
     }
 
@@ -173,17 +180,21 @@ impl NetworkClient {
         let data = self.query(r#"{
           graphNetwork(id: "1") {
             totalTokensSignalled
+            currentEpoch
+            epochLength
           }
         }"#, None).await?;
 
         let n = &data["graphNetwork"];
-        // issuancePerBlock in GRT wei/block; Arbitrum ~2 sec blocks, ~15M blocks/year
-        // We use a hardcoded monthly figure as fallback since it's stable
         let total_signal = Grt::from_wei(n["totalTokensSignalled"].as_str().unwrap_or("0"));
+        let current_epoch = n["currentEpoch"].as_u64().unwrap_or(0);
+        let epoch_length = n["epochLength"].as_u64().unwrap_or(0);
 
         Ok(NetworkStats {
             total_signal,
             monthly_issuance: Grt(26_100_000.0), // ~26.1M GRT/month (May 2026)
+            current_epoch,
+            epoch_length,
         })
     }
 
@@ -267,6 +278,9 @@ pub struct IndexerDetails {
     pub allocated: Grt,
     pub capacity: Grt,
     pub available: Grt,
+    pub rewards_earned: Grt,
+    pub query_fees: Grt,
+    pub delegation_exchange_rate: f64,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -324,6 +338,8 @@ impl DeploymentInfo {
 pub struct NetworkStats {
     pub total_signal: Grt,
     pub monthly_issuance: Grt,
+    pub current_epoch: u64,
+    pub epoch_length: u64,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]

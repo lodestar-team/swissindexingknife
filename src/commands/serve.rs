@@ -32,6 +32,7 @@ pub async fn run(cfg: Config, port: u16, open: bool) -> Result<()> {
         .route("/", get(serve_html))
         .route("/api/data", get(api_data))
         .route("/api/server", get(api_server))
+        .route("/api/tap", get(api_tap))
         .layer(CorsLayer::permissive())
         .with_state(state);
 
@@ -116,6 +117,12 @@ async fn api_data(State(state): State<AppState>) -> impl IntoResponse {
         });
         let eta_h = sync.and_then(|s| sync_eta_hours.get(&s.subgraph).copied());
         let rate_bph = sync.and_then(|s| sync_rates_bph.get(&s.subgraph).copied());
+        let current_epoch = net_stats.as_ref().map(|ns| ns.current_epoch).unwrap_or(0);
+        let epoch_age = if a.created_at_epoch > 0 && current_epoch > 0 {
+            Some(current_epoch.saturating_sub(a.created_at_epoch as u64))
+        } else {
+            None
+        };
 
         enriched_allocs.push(serde_json::json!({
             "id": a.id,
@@ -138,6 +145,8 @@ async fn api_data(State(state): State<AppState>) -> impl IntoResponse {
             "sync_eta_hours": eta_h.map(|h| if h.is_finite() { h } else { -1.0 }),
             "health": sync.map(|s| s.health.as_str()),
             "network": sync.map(|s| s.network.as_str()),
+            "created_at_epoch": a.created_at_epoch,
+            "epoch_age": epoch_age,
         }));
     }
 
@@ -205,8 +214,15 @@ async fn api_data(State(state): State<AppState>) -> impl IntoResponse {
                 "allocated_grt": i.allocated.0,
                 "available_grt": i.available.0,
                 "utilisation_pct": if i.capacity.0 > 0.0 { i.allocated.0 / i.capacity.0 * 100.0 } else { 0.0 },
+                "rewards_earned_grt": i.rewards_earned.0,
+                "query_fees_grt": i.query_fees.0,
+                "delegation_exchange_rate": i.delegation_exchange_rate,
             })),
         },
+        "epoch": net_stats.as_ref().map(|ns| serde_json::json!({
+            "current": ns.current_epoch,
+            "length_blocks": ns.epoch_length,
+        })),
         "economics": {
             "est_grt_month": est_total_monthly,
             "est_usd_month": est_total_monthly * grt_price,
@@ -217,6 +233,8 @@ async fn api_data(State(state): State<AppState>) -> impl IntoResponse {
         "network_stats": net_stats.map(|ns| serde_json::json!({
             "total_signal_grt": ns.total_signal.0,
             "monthly_issuance_grt": ns.monthly_issuance.0,
+            "current_epoch": ns.current_epoch,
+            "epoch_length": ns.epoch_length,
         })),
         "allocations": enriched_allocs,
         "rules": rules,
@@ -235,6 +253,108 @@ async fn api_server(State(state): State<AppState>) -> impl IntoResponse {
     let cfg = &state.cfg;
     let metrics = collect_server_metrics(cfg).await;
     Json(metrics)
+}
+
+async fn api_tap(State(state): State<AppState>) -> impl IntoResponse {
+    let metrics = collect_tap_metrics(&state.cfg).await;
+    Json(metrics)
+}
+
+async fn collect_tap_metrics(cfg: &Config) -> serde_json::Value {
+    let key = crate::executor::shellexpand_tilde(&cfg.server.ssh_key);
+    let cmd = format!(
+        "docker exec indexer-tap curl -s --max-time 8 http://localhost:7300/metrics 2>/dev/null || \
+         docker exec indexer-agent curl -s --max-time 8 http://indexer-tap:7300/metrics 2>/dev/null"
+    );
+
+    let result = tokio::process::Command::new("ssh")
+        .args([
+            "-i", &key,
+            "-o", "BatchMode=yes",
+            "-o", "StrictHostKeyChecking=accept-new",
+            "-o", "ConnectTimeout=8",
+            &format!("{}@{}", cfg.server.user, cfg.server.host),
+            &cmd,
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .await;
+
+    match result {
+        Err(e) => serde_json::json!({ "error": e.to_string() }),
+        Ok(out) => {
+            let text = String::from_utf8_lossy(&out.stdout);
+            parse_tap_metrics(&text)
+        }
+    }
+}
+
+fn parse_tap_metrics(text: &str) -> serde_json::Value {
+    // Parse Prometheus text format for TAP metrics
+    let mut alloc_fees: HashMap<String, f64> = HashMap::new();
+    let mut alloc_receipts: HashMap<String, u64> = HashMap::new();
+    let mut alloc_ravs: HashMap<String, u64> = HashMap::new();
+    let mut total_unaggregated: f64 = 0.0;
+
+    for line in text.lines() {
+        if line.starts_with('#') { continue; }
+
+        if line.starts_with("tap_unaggregated_fees_grt_total_by_version{") {
+            if let Some((labels, val)) = parse_prom_line(line) {
+                if let (Some(alloc), Ok(v)) = (labels.get("allocation"), val.parse::<f64>()) {
+                    let alloc = alloc.to_lowercase();
+                    *alloc_fees.entry(alloc).or_default() += v;
+                    total_unaggregated += v;
+                }
+            }
+        } else if line.starts_with("tap_receipts_received_total{") {
+            if let Some((labels, val)) = parse_prom_line(line) {
+                if let (Some(alloc), Ok(v)) = (labels.get("allocation"), val.parse::<u64>()) {
+                    let alloc = alloc.to_lowercase();
+                    *alloc_receipts.entry(alloc).or_default() += v;
+                }
+            }
+        } else if line.starts_with("tap_ravs_created_total_by_version{") {
+            if let Some((labels, val)) = parse_prom_line(line) {
+                if let (Some(alloc), Ok(v)) = (labels.get("allocation"), val.parse::<u64>()) {
+                    let alloc = alloc.to_lowercase();
+                    *alloc_ravs.entry(alloc).or_default() += v;
+                }
+            }
+        }
+    }
+
+    let wei_per_grt = 1e18;
+    let per_alloc: serde_json::Value = alloc_fees.iter().map(|(alloc, &fees_wei)| {
+        (alloc.clone(), serde_json::json!({
+            "unaggregated_fees_grt": fees_wei / wei_per_grt,
+            "receipts": alloc_receipts.get(alloc).copied().unwrap_or(0),
+            "ravs_created": alloc_ravs.get(alloc).copied().unwrap_or(0),
+        }))
+    }).collect::<serde_json::Map<_, _>>().into();
+
+    serde_json::json!({
+        "total_unaggregated_grt": total_unaggregated / wei_per_grt,
+        "per_allocation": per_alloc,
+    })
+}
+
+fn parse_prom_line(line: &str) -> Option<(HashMap<String, String>, &str)> {
+    // Format: metric_name{label="value",...} numeric_value
+    let brace_start = line.find('{')?;
+    let brace_end = line.find('}')?;
+    let labels_str = &line[brace_start + 1..brace_end];
+    let val = line[brace_end + 1..].trim().split_whitespace().next()?;
+
+    let mut labels = HashMap::new();
+    for part in labels_str.split(',') {
+        let mut kv = part.splitn(2, '=');
+        if let (Some(k), Some(v)) = (kv.next(), kv.next()) {
+            labels.insert(k.trim().to_string(), v.trim_matches('"').to_string());
+        }
+    }
+    Some((labels, val))
 }
 
 async fn collect_server_metrics(cfg: &Config) -> serde_json::Value {
@@ -701,7 +821,7 @@ canvas { max-height: 200px; }
   <div class="address" id="hdr-address">loading...</div>
   <div class="live-dot"></div>
   <span id="grt-price" class="badge badge-gold">GRT $—</span>
-  <span id="reo-badge" class="badge badge-dim">REO —</span>
+  <span id="hdr-epoch" class="badge badge-dim">EPOCH —</span>
   <span id="hdr-net" class="badge badge-copper">—</span>
   <span id="ts">—</span>
   <span id="refresh-icon" style="color:var(--dim)"></span>
@@ -727,6 +847,13 @@ canvas { max-height: 200px; }
     <div class="card"><div class="card-label">⚡ Net P&amp;L / Month</div><div class="card-value" id="e-pnl">—</div><div class="card-sub" id="e-pnl-grt">USD</div></div>
   </div>
 
+  <!-- ── Lifetime stats ────────────────────────── -->
+  <div class="cards cards-3" id="lifetime-cards">
+    <div class="card"><div class="card-label">★ Lifetime Rewards Earned</div><div class="card-value gold" id="l-rewards">—</div><div class="card-sub">GRT all time</div></div>
+    <div class="card"><div class="card-label">★ Lifetime Query Fees</div><div class="card-value" id="l-fees">—</div><div class="card-sub">GRT all time</div></div>
+    <div class="card"><div class="card-label">★ Delegation Exchange Rate</div><div class="card-value" id="l-delrate">—</div><div class="card-sub">GRT per share (delegator appreciation)</div></div>
+  </div>
+
   <!-- ── Main: allocations + server ────────────── -->
   <div class="panel-grid panel-grid-2">
 
@@ -749,11 +876,12 @@ canvas { max-height: 200px; }
               <th>EST USD/MO</th>
               <th>SYNC</th>
               <th>ETA</th>
+              <th>AGE</th>
               <th>NET</th>
             </tr>
           </thead>
           <tbody id="alloc-body">
-            <tr><td colspan="10" class="empty">Loading...</td></tr>
+            <tr><td colspan="11" class="empty">Loading...</td></tr>
           </tbody>
         </table>
       </div>
@@ -834,6 +962,34 @@ canvas { max-height: 200px; }
     <div class="panel">
       <div class="panel-header">⚙ ZOMBIE DEPLOYMENTS <span class="val-dim" style="font-weight:400;font-size:10px">syncing, no allocation</span></div>
       <div class="panel-body" id="zombie-body"><div class="empty">Loading...</div></div>
+    </div>
+
+  </div>
+
+  <!-- ── Indexing rules + TAP ──────────────────── -->
+  <div class="panel-grid panel-grid-2">
+
+    <div class="panel">
+      <div class="panel-header">⚙ INDEXING RULES</div>
+      <div style="overflow-x:auto">
+        <table class="tbl" id="rules-table">
+          <thead><tr><th>IDENTIFIER</th><th>BASIS</th><th>AMOUNT GRT</th><th>NETWORK</th></tr></thead>
+          <tbody id="rules-body"><tr><td colspan="4" class="empty">Loading...</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="panel">
+      <div class="panel-header" style="justify-content:space-between">
+        <span>⚙ QUERY FEES (TAP)</span>
+        <span id="tap-total" class="val-gold" style="font-size:13px;font-weight:700"></span>
+      </div>
+      <div style="overflow-x:auto">
+        <table class="tbl" id="tap-table">
+          <thead><tr><th>ALLOCATION</th><th>FEES GRT</th><th>RECEIPTS</th><th>RAVs</th></tr></thead>
+          <tbody id="tap-body"><tr><td colspan="4" class="empty">Loading...</td></tr></tbody>
+        </table>
+      </div>
     </div>
 
   </div>
@@ -937,7 +1093,7 @@ function renderAllocations(allocs) {
   const body = document.getElementById('alloc-body');
   document.getElementById('alloc-count').textContent = allocs.length + ' active';
   if (!allocs.length) {
-    body.innerHTML = '<tr><td colspan="10" class="empty">No active allocations</td></tr>';
+    body.innerHTML = '<tr><td colspan="11" class="empty">No active allocations</td></tr>';
     return;
   }
 
@@ -975,6 +1131,7 @@ function renderAllocations(allocs) {
         </div>
       </td>
       <td>${etaStr}</td>
+      <td class="val-dim">${a.epoch_age != null ? a.epoch_age + 'ep' : '—'}</td>
       <td>${network}</td>
     </tr>`;
   }).join('');
@@ -1126,12 +1283,14 @@ function renderZombies(zombies) {
 }
 
 function render(data) {
-  // Header
   document.getElementById('hdr-address').textContent = data.indexer?.address || '—';
   document.getElementById('grt-price').textContent = 'GRT $' + (data.grt_price_usd || 0).toFixed(5);
   document.getElementById('hdr-net').textContent = data.network || '—';
+  if (data.epoch) {
+    document.getElementById('hdr-epoch').textContent = 'EPOCH ' + data.epoch.current;
+    document.getElementById('hdr-epoch').className = 'badge badge-copper';
+  }
 
-  // Stake cards
   const s = data.indexer?.stake;
   if (s) {
     document.getElementById('s-own').textContent   = fmt.grt(s.own_grt);
@@ -1145,9 +1304,14 @@ function render(data) {
     const freeEl = document.getElementById('s-free');
     freeEl.className = 'card-value ' + (free < 5000 ? 'red' : free < 20000 ? 'amber' : 'green');
 
+    // Lifetime stats
+    document.getElementById('l-rewards').textContent = fmt.grt(s.rewards_earned_grt);
+    document.getElementById('l-fees').textContent    = s.query_fees_grt != null
+      ? s.query_fees_grt.toFixed(6) + ' GRT' : '—';
+    document.getElementById('l-delrate').textContent = s.delegation_exchange_rate != null
+      ? s.delegation_exchange_rate.toFixed(6) : '—';
   }
 
-  // Economics
   const e = data.economics;
   if (e) {
     document.getElementById('e-rewards').textContent    = fmt.grt(e.est_grt_month);
@@ -1165,6 +1329,60 @@ function render(data) {
   renderActions(data.actions || []);
   renderZombies(data.zombies || []);
   renderRewards(data.rewards_history || [], data.rewards_total_grt, data.rewards_total_usd);
+  renderRules(data.rules || []);
+}
+
+function renderRules(rules) {
+  const body = document.getElementById('rules-body');
+  if (!rules.length) {
+    body.innerHTML = '<tr><td colspan="4" class="empty">No indexing rules</td></tr>';
+    return;
+  }
+  body.innerHTML = rules.map(r => {
+    const basisColor = r.decision_basis === 'always' ? 'val-green'
+      : r.decision_basis === 'never' ? 'val-red' : 'val-dim';
+    const id = r.identifier.length > 20
+      ? r.identifier.substring(0,8) + '…' + r.identifier.slice(-4)
+      : r.identifier;
+    return `<tr>
+      <td><span class="hash">${id}</span></td>
+      <td class="${basisColor}">${r.decision_basis}</td>
+      <td class="val">${r.allocation_amount > 0 ? fmt.grt(r.allocation_amount) : '—'}</td>
+      <td class="val-dim">${r.protocol_network || '—'}</td>
+    </tr>`;
+  }).join('');
+}
+
+function renderTap(tap) {
+  const body = document.getElementById('tap-body');
+  const totalEl = document.getElementById('tap-total');
+
+  if (!tap || tap.error) {
+    body.innerHTML = `<tr><td colspan="4" class="empty">${tap?.error || 'Unavailable'}</td></tr>`;
+    return;
+  }
+
+  const total = tap.total_unaggregated_grt || 0;
+  if (totalEl) totalEl.textContent = total.toFixed(6) + ' GRT unaggregated';
+
+  const perAlloc = tap.per_allocation || {};
+  const entries = Object.entries(perAlloc).filter(([, v]) => v.receipts > 0 || v.unaggregated_fees_grt > 0);
+
+  if (!entries.length) {
+    body.innerHTML = '<tr><td colspan="4" class="empty" style="color:var(--green)">No active receipts</td></tr>';
+    return;
+  }
+
+  entries.sort((a, b) => b[1].unaggregated_fees_grt - a[1].unaggregated_fees_grt);
+  body.innerHTML = entries.map(([alloc, v]) => {
+    const short = alloc.substring(0, 10) + '…' + alloc.slice(-4);
+    return `<tr>
+      <td><span class="hash">${short}</span></td>
+      <td class="val-gold">${v.unaggregated_fees_grt.toFixed(6)}</td>
+      <td class="val">${v.receipts}</td>
+      <td class="val-dim">${v.ravs_created}</td>
+    </tr>`;
+  }).join('');
 }
 
 function renderRewards(rewards, totalGrt, totalUsd) {
@@ -1231,12 +1449,25 @@ async function fetchServer() {
   }
 }
 
+async function fetchTap() {
+  try {
+    const res = await fetch('/api/tap');
+    if (!res.ok) return;
+    const tap = await res.json();
+    renderTap(tap);
+  } catch(e) {
+    renderTap({ error: e.message });
+  }
+}
+
 // Boot
 initCharts();
 fetchData();
 fetchServer();
+fetchTap();
 setInterval(fetchData, 30000);
 setInterval(fetchServer, 60000);
+setInterval(fetchTap, 60000);
 setInterval(updateTimestamp, 1000);
 </script>
 
