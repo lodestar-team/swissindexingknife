@@ -633,7 +633,7 @@ canvas { max-height: 200px; }
 <body>
 
 <header>
-  <div class="logo">LODESTAR<span> // </span>INDEXER</div>
+  <div class="logo">LODESTAR<span> // </span>SWISS INDEXING KNIFE 🔪</div>
   <div class="address" id="hdr-address">loading...</div>
   <div class="live-dot"></div>
   <span id="grt-price" class="badge badge-gold">GRT $—</span>
