@@ -5,20 +5,28 @@ use axum::{
     routing::get,
     Json, Router,
 };
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use tower_http::cors::CorsLayer;
 
 use crate::client::{GraphNodeClient, ManagementClient, NetworkClient};
 use crate::config::Config;
 use crate::executor::RemoteExecutor;
 
+/// Tracks (latest_block, timestamp_secs) per subgraph for sync rate calculation.
+type SyncHistory = Arc<Mutex<HashMap<String, (u64, u64)>>>;
+
 #[derive(Clone)]
 struct AppState {
     cfg: Arc<Config>,
+    sync_history: SyncHistory,
 }
 
 pub async fn run(cfg: Config, port: u16, open: bool) -> Result<()> {
-    let state = AppState { cfg: Arc::new(cfg) };
+    let state = AppState {
+        cfg: Arc::new(cfg),
+        sync_history: Arc::new(Mutex::new(HashMap::new())),
+    };
 
     let app = Router::new()
         .route("/", get(serve_html))
@@ -52,7 +60,7 @@ async fn api_data(State(state): State<AppState>) -> impl IntoResponse {
 
     let grt_price = cfg.grt_price.manual_price_usd.unwrap_or(0.02646);
 
-    let (allocs_r, rules_r, actions_r, statuses_r, indexer_r, thaws_r, net_stats_r) = tokio::join!(
+    let (allocs_r, rules_r, actions_r, statuses_r, indexer_r, thaws_r, net_stats_r, closed_r) = tokio::join!(
         mgmt.active_allocations(),
         mgmt.indexing_rules(),
         mgmt.actions(),
@@ -60,6 +68,7 @@ async fn api_data(State(state): State<AppState>) -> impl IntoResponse {
         net.indexer_details(),
         net.thaw_requests(),
         net.network_stats(),
+        net.closed_allocations_this_month(),
     );
 
     let allocs = allocs_r.unwrap_or_default();
@@ -68,6 +77,31 @@ async fn api_data(State(state): State<AppState>) -> impl IntoResponse {
     let statuses = statuses_r.unwrap_or_default();
     let thaws = thaws_r.unwrap_or_default();
     let net_stats = net_stats_r.ok();
+    let closed_allocs = closed_r.unwrap_or_default();
+
+    // ── Sync ETA computation ─────────────────────────────────────────────────
+    // Compare current block numbers against last-seen values to compute rate.
+    let now_secs = chrono::Utc::now().timestamp() as u64;
+    let mut sync_rates_bph: HashMap<String, f64> = HashMap::new();
+    let mut sync_eta_hours: HashMap<String, f64> = HashMap::new();
+    {
+        let mut history = state.sync_history.lock().unwrap();
+        for s in &statuses {
+            if s.synced || s.chain_head_block == 0 || s.latest_block == 0 { continue; }
+            if let Some((prev_block, prev_ts)) = history.get(&s.subgraph).copied() {
+                let elapsed = now_secs.saturating_sub(prev_ts);
+                if elapsed >= 10 && s.latest_block > prev_block {
+                    let bps = (s.latest_block - prev_block) as f64 / elapsed as f64;
+                    let bph = bps * 3600.0;
+                    let behind = s.chain_head_block.saturating_sub(s.latest_block) as f64;
+                    let eta_h = if bps > 0.0 { behind / bps / 3600.0 } else { f64::INFINITY };
+                    sync_rates_bph.insert(s.subgraph.clone(), bph);
+                    sync_eta_hours.insert(s.subgraph.clone(), eta_h);
+                }
+            }
+            history.insert(s.subgraph.clone(), (s.latest_block, now_secs));
+        }
+    }
 
     // Enrich allocations with network data
     let mut enriched_allocs = Vec::new();
@@ -80,6 +114,8 @@ async fn api_data(State(state): State<AppState>) -> impl IntoResponse {
         let our_share = nd.as_ref().map(|d| {
             if d.staked.0 > 0.0 { a.allocated_tokens.0 / d.staked.0 * 100.0 } else { 100.0 }
         });
+        let eta_h = sync.and_then(|s| sync_eta_hours.get(&s.subgraph).copied());
+        let rate_bph = sync.and_then(|s| sync_rates_bph.get(&s.subgraph).copied());
 
         enriched_allocs.push(serde_json::json!({
             "id": a.id,
@@ -96,6 +132,10 @@ async fn api_data(State(state): State<AppState>) -> impl IntoResponse {
             "synced": sync.map(|s| s.synced),
             "sync_pct": sync.map(|s| s.pct_synced()),
             "blocks_behind": sync.map(|s| s.blocks_behind()),
+            "latest_block": sync.map(|s| s.latest_block),
+            "chain_head_block": sync.map(|s| s.chain_head_block),
+            "sync_rate_bph": rate_bph,
+            "sync_eta_hours": eta_h.map(|h| if h.is_finite() { h } else { -1.0 }),
             "health": sync.map(|s| s.health.as_str()),
             "network": sync.map(|s| s.network.as_str()),
         }));
@@ -130,6 +170,27 @@ async fn api_data(State(state): State<AppState>) -> impl IntoResponse {
         .filter_map(|a| a["est_grt_month"].as_f64())
         .sum();
 
+    // Rewards history (closed allocations last 30 days)
+    let rewards_total_grt: f64 = closed_allocs.iter().map(|c| c.indexing_rewards.0).sum();
+    let rewards_json: Vec<_> = {
+        let mut v = closed_allocs.clone();
+        v.sort_by(|a, b| b.closed_at.cmp(&a.closed_at));
+        v.iter().map(|c| {
+            let closed_iso = chrono::DateTime::from_timestamp(c.closed_at, 0)
+                .map(|dt| dt.format("%Y-%m-%d %H:%M UTC").to_string())
+                .unwrap_or_else(|| "unknown".into());
+            serde_json::json!({
+                "id": c.id,
+                "short_hash": short_hash(&c.ipfs_hash),
+                "ipfs_hash": c.ipfs_hash,
+                "allocated_grt": c.allocated_tokens.0,
+                "rewards_grt": c.indexing_rewards.0,
+                "rewards_usd": c.indexing_rewards.0 * grt_price,
+                "closed_at_iso": closed_iso,
+            })
+        }).collect()
+    };
+
     let out = serde_json::json!({
         "timestamp": chrono::Utc::now().to_rfc3339(),
         "grt_price_usd": grt_price,
@@ -162,6 +223,9 @@ async fn api_data(State(state): State<AppState>) -> impl IntoResponse {
         "actions": actions,
         "thaws": thaws_json,
         "zombies": zombies,
+        "rewards_history": rewards_json,
+        "rewards_total_grt": rewards_total_grt,
+        "rewards_total_usd": rewards_total_grt * grt_price,
     });
 
     Json(out)
@@ -684,11 +748,12 @@ canvas { max-height: 200px; }
               <th>EST GRT/MO</th>
               <th>EST USD/MO</th>
               <th>SYNC</th>
+              <th>ETA</th>
               <th>NET</th>
             </tr>
           </thead>
           <tbody id="alloc-body">
-            <tr><td colspan="9" class="empty">Loading...</td></tr>
+            <tr><td colspan="10" class="empty">Loading...</td></tr>
           </tbody>
         </table>
       </div>
@@ -773,6 +838,28 @@ canvas { max-height: 200px; }
 
   </div>
 
+  <!-- ── Rewards history ─────────────────────────── -->
+  <div class="panel">
+    <div class="panel-header" style="justify-content:space-between">
+      <span>⚙ REWARDS RECEIVED — LAST 30 DAYS</span>
+      <span id="rewards-total" class="val-gold" style="font-size:13px;font-weight:700"></span>
+    </div>
+    <div style="overflow-x:auto">
+      <table class="tbl" id="rewards-table">
+        <thead>
+          <tr>
+            <th>CLOSED AT</th>
+            <th>DEPLOYMENT</th>
+            <th>ALLOCATED GRT</th>
+            <th>REWARDS GRT</th>
+            <th>REWARDS USD</th>
+          </tr>
+        </thead>
+        <tbody id="rewards-body"><tr><td colspan="5" class="empty">Loading...</td></tr></tbody>
+      </table>
+    </div>
+  </div>
+
 </main>
 
 <script>
@@ -850,7 +937,7 @@ function renderAllocations(allocs) {
   const body = document.getElementById('alloc-body');
   document.getElementById('alloc-count').textContent = allocs.length + ' active';
   if (!allocs.length) {
-    body.innerHTML = '<tr><td colspan="9" class="empty">No active allocations</td></tr>';
+    body.innerHTML = '<tr><td colspan="10" class="empty">No active allocations</td></tr>';
     return;
   }
 
@@ -858,10 +945,20 @@ function renderAllocations(allocs) {
     const syncPct = a.sync_pct ?? 0;
     const synced = a.synced;
     const syncColor = synced ? 'green' : syncPct > 50 ? 'amber' : 'red';
-    const syncLabel = synced ? '<span class="val-green">SYNCED</span>' : `<span class="val-${syncColor}">${fmt.pct(syncPct)}</span>`;
     const ratioStr = a.ratio != null ? `<span class="${ratioClass(a.ratio)}">${fmt.ratio(a.ratio)}</span>` : '—';
-    const denied = a.denied_at && a.denied_at > 0;
     const network = a.network ? `<span class="val-dim">${a.network}</span>` : '';
+
+    let etaStr = '—';
+    if (synced) {
+      etaStr = '<span style="color:var(--green)">synced</span>';
+    } else if (a.sync_eta_hours != null && a.sync_eta_hours >= 0) {
+      const h = a.sync_eta_hours;
+      if (h < 1) etaStr = `<span class="val-amber">~${Math.round(h*60)}m</span>`;
+      else if (h < 24) etaStr = `<span class="val-amber">~${h.toFixed(1)}h</span>`;
+      else etaStr = `<span class="val-dim">~${(h/24).toFixed(1)}d</span>`;
+    } else if (syncPct > 0 && !synced) {
+      etaStr = '<span class="val-dim">measuring…</span>';
+    }
 
     return `<tr>
       <td><span class="hash">${a.short_hash}</span></td>
@@ -869,7 +966,7 @@ function renderAllocations(allocs) {
       <td class="val">${fmt.grt(a.signal_grt)}</td>
       <td>${ratioStr}</td>
       <td class="val">${fmt.pct(a.our_share_pct)}</td>
-      <td class="val-green">${fmt.grt(a.est_grt_month)}</td>
+      <td class="val-gold">${fmt.grt(a.est_grt_month)}</td>
       <td class="val-amber">${fmt.usd(a.est_usd_month)}</td>
       <td>
         <div class="bar-wrap">
@@ -877,6 +974,7 @@ function renderAllocations(allocs) {
           <div class="bar-label">${synced ? '<span style="color:var(--green)">✓</span>' : fmt.pct(syncPct)}</div>
         </div>
       </td>
+      <td>${etaStr}</td>
       <td>${network}</td>
     </tr>`;
   }).join('');
@@ -1066,6 +1164,33 @@ function render(data) {
   renderThaws(data.thaws || []);
   renderActions(data.actions || []);
   renderZombies(data.zombies || []);
+  renderRewards(data.rewards_history || [], data.rewards_total_grt, data.rewards_total_usd);
+}
+
+function renderRewards(rewards, totalGrt, totalUsd) {
+  const body = document.getElementById('rewards-body');
+  const totalEl = document.getElementById('rewards-total');
+
+  if (totalEl) {
+    if (totalGrt > 0) {
+      totalEl.textContent = fmt.grt(totalGrt) + ' GRT  /  ' + fmt.usd(totalUsd);
+    } else {
+      totalEl.textContent = 'No closed allocations this month';
+    }
+  }
+
+  if (!rewards.length) {
+    body.innerHTML = '<tr><td colspan="5" class="empty">No closed allocations in the last 30 days</td></tr>';
+    return;
+  }
+
+  body.innerHTML = rewards.map(r => `<tr>
+    <td class="val-dim">${r.closed_at_iso}</td>
+    <td><span class="hash">${r.short_hash}</span></td>
+    <td class="val">${fmt.grt(r.allocated_grt)}</td>
+    <td class="val-gold">${fmt.grt(r.rewards_grt)}</td>
+    <td class="val-amber">${fmt.usd(r.rewards_usd)}</td>
+  </tr>`).join('');
 }
 
 let lastUpdate = null;
