@@ -196,7 +196,17 @@ fn parse_graphql_response(raw: &[u8]) -> Result<serde_json::Value> {
     Ok(value["data"].clone())
 }
 
-// Bring in shellexpand for tilde expansion
+/// Expand a leading `~/` to the user's home directory.
+pub fn shellexpand_tilde(s: &str) -> String {
+    if s.starts_with("~/") {
+        if let Some(home) = dirs::home_dir() {
+            return format!("{}{}", home.display(), &s[1..]);
+        }
+    }
+    s.to_string()
+}
+
+// Private alias used inside this module
 mod shellexpand {
     pub fn tilde(s: &str) -> std::borrow::Cow<str> {
         if s.starts_with("~/") {

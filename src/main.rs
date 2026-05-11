@@ -97,6 +97,16 @@ enum Commands {
     /// Full context dump for AI agents (JSON only).
     /// Aggregates all state + recommendations in one call.
     Context,
+
+    /// Launch the hacker-style web dashboard
+    Serve {
+        /// Port to listen on
+        #[arg(long, default_value = "7777")]
+        port: u16,
+        /// Open browser automatically
+        #[arg(long)]
+        open: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -209,6 +219,10 @@ async fn main() -> Result<()> {
 
         Commands::Context => {
             commands::context::run(&cfg).await?;
+        }
+
+        Commands::Serve { port, open } => {
+            commands::serve::run(cfg, port, open).await?;
         }
     }
 
