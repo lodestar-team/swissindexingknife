@@ -207,12 +207,12 @@ docker ps --format '{"name":"{{.Names}}","status":"{{.Status}}","image":"{{.Imag
         Err(e) => serde_json::json!({ "error": e.to_string() }),
         Ok(out) => {
             let text = String::from_utf8_lossy(&out.stdout);
-            parse_server_metrics(&text)
+            parse_server_metrics(&text, &cfg.server.host)
         }
     }
 }
 
-fn parse_server_metrics(text: &str) -> serde_json::Value {
+fn parse_server_metrics(text: &str, host: &str) -> serde_json::Value {
     let mut load: Option<(f64, f64, f64)> = None;
     let mut mem_total: u64 = 0;
     let mut mem_used: u64 = 0;
@@ -285,7 +285,7 @@ fn parse_server_metrics(text: &str) -> serde_json::Value {
             "pct": disk_pct,
         },
         "uptime": uptime_str,
-        "host": "65.109.22.252",
+        "host": host,
         "containers": containers,
     })
 }
@@ -311,17 +311,20 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
 <style>
 :root {
-  --bg:       #070710;
-  --surface:  #0d0d1f;
-  --surface2: #13132a;
-  --border:   #1c1c3a;
-  --green:    #00ff88;
-  --cyan:     #00d4ff;
-  --amber:    #ffb300;
-  --red:      #ff4455;
-  --purple:   #a855f7;
-  --text:     #c8d3f5;
-  --dim:      #4a5270;
+  --bg:       #080501;
+  --surface:  #120c03;
+  --surface2: #1a1105;
+  --border:   #5c3d15;
+  --border2:  #3a2709;
+  --copper:   #c4922a;
+  --gold:     #e8b84b;
+  --brass:    #b8952a;
+  --green:    #7eb87e;
+  --red:      #cc4422;
+  --amber:    #e8922a;
+  --dim:      #7d6035;
+  --text:     #d4c49a;
+  --steam:    #f0e0b8;
   --font:     'JetBrains Mono', 'Courier New', monospace;
 }
 
@@ -331,17 +334,16 @@ body {
   background: var(--bg);
   color: var(--text);
   font-family: var(--font);
-  font-size: 11px;
+  font-size: 13px;
   min-height: 100vh;
   overflow-x: hidden;
 }
 
-/* Subtle scanline overlay */
 body::after {
   content: '';
   position: fixed;
   inset: 0;
-  background: repeating-linear-gradient(0deg, transparent, transparent 2px, rgba(0,0,0,.03) 2px, rgba(0,0,0,.03) 4px);
+  background: repeating-linear-gradient(0deg, transparent, transparent 3px, rgba(0,0,0,.05) 3px, rgba(0,0,0,.05) 6px);
   pointer-events: none;
   z-index: 9999;
 }
@@ -350,112 +352,118 @@ body::after {
 header {
   display: flex;
   align-items: center;
-  gap: 16px;
-  padding: 10px 16px;
-  border-bottom: 1px solid var(--border);
-  background: var(--surface);
+  gap: 18px;
+  padding: 12px 20px;
+  border-bottom: 2px solid var(--border);
+  background: linear-gradient(180deg, #1c1206 0%, var(--surface) 100%);
   position: sticky;
   top: 0;
   z-index: 100;
 }
 
 .logo {
-  font-size: 15px;
+  font-size: 18px;
   font-weight: 700;
-  letter-spacing: 3px;
-  color: var(--cyan);
-  text-shadow: 0 0 20px rgba(0,212,255,.4);
+  letter-spacing: 4px;
+  color: var(--gold);
+  text-shadow: 0 0 30px rgba(232,184,75,.35);
 }
 
 .logo span { color: var(--dim); }
 
 .address {
   color: var(--dim);
-  font-size: 10px;
+  font-size: 11px;
   letter-spacing: 1px;
   flex: 1;
 }
 
 .live-dot {
-  width: 7px;
-  height: 7px;
+  width: 8px;
+  height: 8px;
   border-radius: 50%;
   background: var(--green);
-  box-shadow: 0 0 8px var(--green);
+  box-shadow: 0 0 10px var(--green);
   animation: pulse 2s infinite;
 }
 
 @keyframes pulse {
-  0%, 100% { opacity: 1; box-shadow: 0 0 8px var(--green); }
+  0%, 100% { opacity: 1; box-shadow: 0 0 10px var(--green); }
   50%       { opacity: .4; box-shadow: none; }
 }
 
 .badge {
-  padding: 2px 8px;
+  padding: 3px 10px;
   border: 1px solid currentColor;
   border-radius: 2px;
-  font-size: 10px;
+  font-size: 11px;
   letter-spacing: 1px;
   font-weight: 700;
 }
 
-.badge-green  { color: var(--green); border-color: rgba(0,255,136,.3); }
-.badge-cyan   { color: var(--cyan);  border-color: rgba(0,212,255,.3); }
-.badge-amber  { color: var(--amber); border-color: rgba(255,179,0,.3); }
-.badge-red    { color: var(--red);   border-color: rgba(255,68,85,.3); }
-.badge-dim    { color: var(--dim);   border-color: var(--border); }
+.badge-gold   { color: var(--gold);   border-color: rgba(232,184,75,.4); }
+.badge-copper { color: var(--copper); border-color: rgba(196,146,42,.4); }
+.badge-green  { color: var(--green);  border-color: rgba(126,184,126,.3); }
+.badge-red    { color: var(--red);    border-color: rgba(204,68,34,.4); }
+.badge-dim    { color: var(--dim);    border-color: var(--border2); }
 
-#ts { color: var(--dim); font-size: 10px; }
-#grt-price { color: var(--amber); font-weight: 700; }
+#ts { color: var(--dim); font-size: 11px; }
+#grt-price { color: var(--gold); font-weight: 700; }
 
 /* ── Layout ─────────────────────────────────────── */
 main {
-  padding: 12px;
+  padding: 16px;
   display: flex;
   flex-direction: column;
-  gap: 10px;
+  gap: 12px;
 }
 
 /* ── Cards (stat blocks) ─────────────────────────── */
-.cards {
-  display: grid;
-  gap: 8px;
-}
+.cards { display: grid; gap: 10px; }
 .cards-5 { grid-template-columns: repeat(5, 1fr); }
 .cards-3 { grid-template-columns: repeat(3, 1fr); }
 
 .card {
   background: var(--surface);
   border: 1px solid var(--border);
-  padding: 12px 14px;
+  border-top: 2px solid var(--copper);
+  padding: 14px 16px;
   border-radius: 2px;
-  transition: border-color .2s;
+  position: relative;
 }
-.card:hover { border-color: rgba(0,212,255,.25); }
+
+.card::before {
+  content: '';
+  position: absolute;
+  top: 0; left: 0; right: 0;
+  height: 1px;
+  background: linear-gradient(90deg, transparent, rgba(232,184,75,.2), transparent);
+}
 
 .card-label {
   color: var(--dim);
-  font-size: 9px;
+  font-size: 10px;
   letter-spacing: 2px;
   text-transform: uppercase;
-  margin-bottom: 6px;
+  margin-bottom: 8px;
 }
 
 .card-value {
-  font-size: 20px;
+  font-size: 26px;
   font-weight: 700;
   line-height: 1;
-  color: var(--cyan);
+  color: var(--copper);
 }
 
 .card-value.green { color: var(--green); }
 .card-value.amber { color: var(--amber); }
+.card-value.gold  { color: var(--gold); }
 .card-value.red   { color: var(--red); }
 
 .card-sub {
   color: var(--dim);
-  font-size: 9px;
-  margin-top: 4px;
+  font-size: 10px;
+  margin-top: 6px;
 }
 
 /* ── Panels ──────────────────────────────────────── */
@@ -470,19 +478,19 @@ main {
   display: flex;
   align-items: center;
   gap: 10px;
-  padding: 8px 12px;
+  padding: 10px 14px;
   border-bottom: 1px solid var(--border);
-  background: var(--surface2);
-  font-size: 9px;
+  background: linear-gradient(180deg, #1e1508 0%, var(--surface2) 100%);
+  font-size: 11px;
   letter-spacing: 2px;
-  color: var(--cyan);
+  color: var(--gold);
   text-transform: uppercase;
   font-weight: 700;
 }
 
-.panel-body { padding: 10px 12px; }
+.panel-body { padding: 12px 14px; }
 
-.panel-grid { display: grid; gap: 10px; }
+.panel-grid { display: grid; gap: 12px; }
 .panel-grid-2 { grid-template-columns: 2fr 1fr; }
 .panel-grid-3 { grid-template-columns: 1fr 1fr 1fr; }
 
@@ -490,28 +498,31 @@ main {
 .tbl { width: 100%; border-collapse: collapse; }
 .tbl th {
   color: var(--dim);
-  font-size: 9px;
-  letter-spacing: 1px;
+  font-size: 10px;
+  letter-spacing: 1.5px;
   text-align: left;
-  padding: 4px 8px;
+  padding: 7px 10px;
   border-bottom: 1px solid var(--border);
   white-space: nowrap;
   font-weight: 400;
+  background: var(--surface2);
 }
 .tbl td {
-  padding: 5px 8px;
-  border-bottom: 1px solid rgba(255,255,255,.03);
+  padding: 8px 10px;
+  border-bottom: 1px solid rgba(92,61,21,.3);
   white-space: nowrap;
   vertical-align: middle;
+  font-size: 13px;
 }
 .tbl tr:last-child td { border-bottom: none; }
-.tbl tr:hover td { background: rgba(255,255,255,.02); }
+.tbl tr:hover td { background: rgba(196,146,42,.04); }
 
 .mono { font-family: var(--font); }
-.hash { color: var(--cyan); font-size: 10px; }
-.val  { color: var(--text); }
+.hash { color: var(--copper); font-size: 12px; }
+.val      { color: var(--text); }
 .val-green { color: var(--green); }
 .val-amber { color: var(--amber); }
+.val-gold  { color: var(--gold); }
 .val-red   { color: var(--red); }
 .val-dim   { color: var(--dim); }
 
@@ -519,15 +530,15 @@ main {
 .bar-wrap {
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: 8px;
 }
 .bar {
   flex: 1;
-  height: 4px;
-  background: var(--surface2);
+  height: 5px;
+  background: var(--border2);
   border-radius: 2px;
   overflow: hidden;
-  min-width: 60px;
+  min-width: 70px;
 }
 .bar-fill {
   height: 100%;
@@ -537,78 +548,80 @@ main {
 .bar-fill.green  { background: var(--green); }
 .bar-fill.amber  { background: var(--amber); }
 .bar-fill.red    { background: var(--red); }
-.bar-fill.cyan   { background: var(--cyan); }
-.bar-fill.purple { background: var(--purple); }
+.bar-fill.gold   { background: var(--gold); }
+.bar-fill.copper { background: var(--copper); }
 
-.bar-label { font-size: 10px; min-width: 36px; text-align: right; }
+.bar-label { font-size: 11px; min-width: 42px; text-align: right; color: var(--text); }
 
 /* ── Server metrics ──────────────────────────────── */
 .metric-row {
   display: flex;
   align-items: center;
-  gap: 8px;
-  padding: 5px 0;
-  border-bottom: 1px solid rgba(255,255,255,.03);
+  gap: 10px;
+  padding: 7px 0;
+  border-bottom: 1px solid rgba(92,61,21,.3);
 }
 .metric-row:last-child { border-bottom: none; }
-.metric-name { color: var(--dim); width: 52px; font-size: 10px; }
-.metric-val  { color: var(--text); width: 54px; font-size: 10px; text-align: right; }
+.metric-name { color: var(--dim); width: 60px; font-size: 11px; letter-spacing: 1px; }
+.metric-val  { color: var(--text); width: 60px; font-size: 11px; text-align: right; }
 
 /* Container statuses */
 .container-row {
   display: flex;
   align-items: center;
-  gap: 6px;
-  padding: 3px 0;
-  font-size: 10px;
+  gap: 8px;
+  padding: 4px 0;
+  font-size: 12px;
 }
-.dot { width: 5px; height: 5px; border-radius: 50%; flex-shrink: 0; }
-.dot-green { background: var(--green); box-shadow: 0 0 4px var(--green); }
+.dot { width: 6px; height: 6px; border-radius: 50%; flex-shrink: 0; }
+.dot-green { background: var(--green); box-shadow: 0 0 5px var(--green); }
 .dot-amber { background: var(--amber); }
 .dot-red   { background: var(--red); }
 .ct-name   { color: var(--text); flex: 1; }
-.ct-status { color: var(--dim); font-size: 9px; }
+.ct-status { color: var(--dim); font-size: 10px; }
 
 /* ── Section label ───────────────────────────────── */
 .section-label {
-  font-size: 9px;
+  font-size: 10px;
   letter-spacing: 2px;
-  color: var(--dim);
+  color: var(--brass);
   text-transform: uppercase;
-  margin-bottom: 4px;
+  margin-bottom: 6px;
+  border-bottom: 1px solid var(--border2);
+  padding-bottom: 4px;
 }
 
 /* ── Empty state ─────────────────────────────────── */
-.empty { color: var(--dim); padding: 12px; font-size: 10px; }
+.empty { color: var(--dim); padding: 14px; font-size: 12px; }
 
 /* ── Chart canvas ────────────────────────────────── */
-canvas { max-height: 180px; }
+canvas { max-height: 200px; }
 
-/* ── Ratio bar ───────────────────────────────────── */
-.ratio-good  { color: var(--green); }
-.ratio-ok    { color: var(--amber); }
-.ratio-bad   { color: var(--red); }
+/* ── Ratio coloring ──────────────────────────────── */
+.ratio-good { color: var(--green); }
+.ratio-ok   { color: var(--amber); }
+.ratio-bad  { color: var(--red); }
 
 /* ── Thaw rows ───────────────────────────────────── */
 .thaw-row {
   display: flex;
   justify-content: space-between;
   align-items: center;
-  padding: 6px 0;
-  border-bottom: 1px solid rgba(255,255,255,.04);
-  font-size: 10px;
+  padding: 8px 0;
+  border-bottom: 1px solid rgba(92,61,21,.3);
+  font-size: 12px;
 }
 .thaw-row:last-child { border-bottom: none; }
 
 /* ── Error banner ────────────────────────────────── */
 #error-banner {
   display: none;
-  padding: 8px 12px;
-  background: rgba(255,68,85,.1);
-  border: 1px solid rgba(255,68,85,.3);
+  padding: 10px 14px;
+  background: rgba(204,68,34,.1);
+  border: 1px solid rgba(204,68,34,.4);
   color: var(--red);
-  font-size: 10px;
-  margin: 8px 12px 0;
+  font-size: 12px;
+  margin: 10px 16px 0;
   border-radius: 2px;
 }
 
@@ -620,12 +633,12 @@ canvas { max-height: 180px; }
 <body>
 
 <header>
-  <div class="logo">LODESTAR<span> //</span> INDEXER</div>
+  <div class="logo">LODESTAR<span> // </span>INDEXER</div>
   <div class="address" id="hdr-address">loading...</div>
   <div class="live-dot"></div>
-  <span id="grt-price" class="badge badge-amber">GRT $—</span>
+  <span id="grt-price" class="badge badge-gold">GRT $—</span>
   <span id="reo-badge" class="badge badge-dim">REO —</span>
-  <span id="hdr-net" class="badge badge-dim">—</span>
+  <span id="hdr-net" class="badge badge-copper">—</span>
   <span id="ts">—</span>
   <span id="refresh-icon" style="color:var(--dim)"></span>
 </header>
@@ -636,18 +649,18 @@ canvas { max-height: 180px; }
 
   <!-- ── Stake cards ─────────────────────────────── -->
   <div class="cards cards-5" id="stake-cards">
-    <div class="card"><div class="card-label">Own Stake</div><div class="card-value" id="s-own">—</div><div class="card-sub">GRT</div></div>
-    <div class="card"><div class="card-label">Delegated</div><div class="card-value" id="s-del">—</div><div class="card-sub">GRT</div></div>
-    <div class="card"><div class="card-label">Capacity</div><div class="card-value" id="s-cap">—</div><div class="card-sub">GRT</div></div>
-    <div class="card"><div class="card-label">Allocated</div><div class="card-value" id="s-alloc">—</div><div class="card-sub" id="s-util">GRT</div></div>
-    <div class="card"><div class="card-label">Free</div><div class="card-value green" id="s-free">—</div><div class="card-sub" id="s-free-pct">GRT</div></div>
+    <div class="card"><div class="card-label">⚙ Own Stake</div><div class="card-value" id="s-own">—</div><div class="card-sub">GRT</div></div>
+    <div class="card"><div class="card-label">⚙ Delegated</div><div class="card-value" id="s-del">—</div><div class="card-sub">GRT</div></div>
+    <div class="card"><div class="card-label">⚙ Capacity</div><div class="card-value" id="s-cap">—</div><div class="card-sub">GRT</div></div>
+    <div class="card"><div class="card-label">⚙ Allocated</div><div class="card-value" id="s-alloc">—</div><div class="card-sub" id="s-util">GRT</div></div>
+    <div class="card"><div class="card-label">⚙ Free</div><div class="card-value green" id="s-free">—</div><div class="card-sub" id="s-free-pct">GRT</div></div>
   </div>
 
   <!-- ── Economics ──────────────────────────────── -->
   <div class="cards cards-3" id="econ-cards">
-    <div class="card"><div class="card-label">Est. Rewards / Month</div><div class="card-value green" id="e-rewards">—</div><div class="card-sub" id="e-rewards-usd">GRT</div></div>
-    <div class="card"><div class="card-label">Monthly Costs</div><div class="card-value amber" id="e-costs">—</div><div class="card-sub">USD</div></div>
-    <div class="card"><div class="card-label">Net P&L / Month</div><div class="card-value" id="e-pnl">—</div><div class="card-sub" id="e-pnl-grt">USD</div></div>
+    <div class="card"><div class="card-label">⚡ Est. Rewards / Month</div><div class="card-value gold" id="e-rewards">—</div><div class="card-sub" id="e-rewards-usd">GRT</div></div>
+    <div class="card"><div class="card-label">⚡ Monthly Costs</div><div class="card-value amber" id="e-costs">—</div><div class="card-sub">USD</div></div>
+    <div class="card"><div class="card-label">⚡ Net P&amp;L / Month</div><div class="card-value" id="e-pnl">—</div><div class="card-sub" id="e-pnl-grt">USD</div></div>
   </div>
 
   <!-- ── Main: allocations + server ────────────── -->
@@ -656,8 +669,8 @@ canvas { max-height: 180px; }
     <!-- Allocations table -->
     <div class="panel">
       <div class="panel-header">
-        <span>ALLOCATIONS</span>
-        <span id="alloc-count" class="val-dim"></span>
+        <span>⚙ ALLOCATIONS</span>
+        <span id="alloc-count" class="val-dim" style="font-weight:400;font-size:10px"></span>
       </div>
       <div style="overflow-x:auto">
         <table class="tbl" id="alloc-table">
@@ -683,9 +696,9 @@ canvas { max-height: 180px; }
 
     <!-- Server metrics -->
     <div class="panel">
-      <div class="panel-header">SERVER METRICS <span id="srv-host" class="val-dim" style="font-weight:400"></span></div>
+      <div class="panel-header">⚙ SERVER METRICS <span id="srv-host" class="val-dim" style="font-weight:400;font-size:10px"></span></div>
       <div class="panel-body">
-        <div class="section-label" style="margin-bottom:8px">SYSTEM</div>
+        <div class="section-label" style="margin-bottom:10px">SYSTEM</div>
         <div class="metric-row">
           <div class="metric-name">CPU</div>
           <div class="bar-wrap" style="flex:1">
@@ -709,14 +722,14 @@ canvas { max-height: 180px; }
         </div>
         <div class="metric-row">
           <div class="metric-name">LOAD</div>
-          <div style="flex:1;color:var(--text);font-size:10px" id="load-val">—</div>
+          <div style="flex:1;color:var(--text);font-size:12px" id="load-val">—</div>
         </div>
         <div class="metric-row">
           <div class="metric-name">UPTIME</div>
-          <div style="flex:1;color:var(--green);font-size:10px" id="uptime-val">—</div>
+          <div style="flex:1;color:var(--green);font-size:12px" id="uptime-val">—</div>
         </div>
 
-        <div class="section-label" style="margin-top:14px;margin-bottom:8px">CONTAINERS</div>
+        <div class="section-label" style="margin-top:16px;margin-bottom:10px">CONTAINERS</div>
         <div id="container-list"><div class="val-dim" style="font-size:10px">Loading...</div></div>
       </div>
     </div>
@@ -726,11 +739,11 @@ canvas { max-height: 180px; }
   <!-- ── Charts ─────────────────────────────────── -->
   <div class="panel-grid panel-grid-2">
     <div class="panel">
-      <div class="panel-header">SIGNAL / STAKE RATIO  <span class="val-dim" style="font-weight:400;font-size:9px">higher = better opportunity</span></div>
+      <div class="panel-header">⚙ SIGNAL / STAKE RATIO  <span class="val-dim" style="font-weight:400;font-size:10px">higher = better opportunity</span></div>
       <div class="panel-body"><canvas id="chart-ratio"></canvas></div>
     </div>
     <div class="panel">
-      <div class="panel-header">SYNC PROGRESS</div>
+      <div class="panel-header">⚙ SYNC PROGRESS</div>
       <div class="panel-body"><canvas id="chart-sync"></canvas></div>
     </div>
   </div>
@@ -739,12 +752,12 @@ canvas { max-height: 180px; }
   <div class="panel-grid panel-grid-3">
 
     <div class="panel">
-      <div class="panel-header">THAW REQUESTS</div>
+      <div class="panel-header">⚙ THAW REQUESTS</div>
       <div class="panel-body" id="thaw-body"><div class="empty">Loading...</div></div>
     </div>
 
     <div class="panel">
-      <div class="panel-header">PENDING ACTIONS</div>
+      <div class="panel-header">⚙ PENDING ACTIONS</div>
       <div style="overflow-x:auto">
         <table class="tbl" id="actions-table">
           <thead><tr><th>ID</th><th>TYPE</th><th>DEPLOYMENT</th><th>AMOUNT</th><th>STATUS</th></tr></thead>
@@ -754,7 +767,7 @@ canvas { max-height: 180px; }
     </div>
 
     <div class="panel">
-      <div class="panel-header">ZOMBIE DEPLOYMENTS <span class="val-dim" style="font-weight:400;font-size:9px">syncing, no allocation</span></div>
+      <div class="panel-header">⚙ ZOMBIE DEPLOYMENTS <span class="val-dim" style="font-weight:400;font-size:10px">syncing, no allocation</span></div>
       <div class="panel-body" id="zombie-body"><div class="empty">Loading...</div></div>
     </div>
 
@@ -797,10 +810,10 @@ function setBar(id, valId, pct, label) {
 let charts = {};
 
 function initCharts() {
-  Chart.defaults.color = '#4a5270';
-  Chart.defaults.borderColor = '#1c1c3a';
+  Chart.defaults.color = '#7d6035';
+  Chart.defaults.borderColor = '#3a2709';
   Chart.defaults.font.family = "'JetBrains Mono', monospace";
-  Chart.defaults.font.size = 10;
+  Chart.defaults.font.size = 11;
 
   const ratioCtx = document.getElementById('chart-ratio').getContext('2d');
   charts.ratio = new Chart(ratioCtx, {
@@ -810,8 +823,8 @@ function initCharts() {
       indexAxis: 'y',
       plugins: { legend: { display: false } },
       scales: {
-        x: { grid: { color: '#1c1c3a' }, ticks: { color: '#4a5270' } },
-        y: { grid: { display: false }, ticks: { color: '#00d4ff', font: { size: 10 } } }
+        x: { grid: { color: '#3a2709' }, ticks: { color: '#7d6035' } },
+        y: { grid: { display: false }, ticks: { color: '#c4922a', font: { size: 11 } } }
       },
       animation: { duration: 600 },
     }
@@ -825,8 +838,8 @@ function initCharts() {
       indexAxis: 'y',
       plugins: { legend: { display: false } },
       scales: {
-        x: { min: 0, max: 100, grid: { color: '#1c1c3a' }, ticks: { color: '#4a5270', callback: v => v + '%' } },
-        y: { grid: { display: false }, ticks: { color: '#00d4ff', font: { size: 10 } } }
+        x: { min: 0, max: 100, grid: { color: '#3a2709' }, ticks: { color: '#7d6035', callback: v => v + '%' } },
+        y: { grid: { display: false }, ticks: { color: '#c4922a', font: { size: 11 } } }
       },
       animation: { duration: 600 },
     }
@@ -874,9 +887,9 @@ function renderAllocations(allocs) {
   charts.ratio.data.datasets[0].data = sorted.map(a => a.ratio || 0);
   charts.ratio.data.datasets[0].backgroundColor = sorted.map(a => {
     const r = a.ratio || 0;
-    if (r >= 0.1) return 'rgba(0,255,136,.7)';
-    if (r >= 0.02) return 'rgba(255,179,0,.7)';
-    return 'rgba(255,68,85,.7)';
+    if (r >= 0.1) return 'rgba(126,184,126,.75)';
+    if (r >= 0.02) return 'rgba(232,146,42,.75)';
+    return 'rgba(204,68,34,.75)';
   });
   charts.ratio.update();
 
@@ -886,9 +899,9 @@ function renderAllocations(allocs) {
   charts.sync.data.datasets[0].data = syncing.map(a => a.sync_pct || 0);
   charts.sync.data.datasets[0].backgroundColor = syncing.map(a => {
     const p = a.sync_pct || 0;
-    if (p > 80) return 'rgba(0,255,136,.7)';
-    if (p > 40) return 'rgba(255,179,0,.7)';
-    return 'rgba(255,68,85,.7)';
+    if (p > 80) return 'rgba(126,184,126,.75)';
+    if (p > 40) return 'rgba(196,146,42,.75)';
+    return 'rgba(204,68,34,.75)';
   });
   charts.sync.update();
 }
@@ -961,7 +974,7 @@ function renderThaws(thaws) {
   body.innerHTML = thaws.map(t => {
     const color = t.mature ? 'val-green' : t.hours_remaining < 24 ? 'val-amber' : 'val-dim';
     const status = t.mature
-      ? '<span class="val-green">★ WITHDRAW NOW</span>'
+      ? '<span class="val-gold">★ WITHDRAW NOW</span>'
       : t.hours_remaining < 24
         ? `<span class="val-amber">${t.hours_remaining.toFixed(1)}h</span>`
         : `<span class="val-dim">${(t.hours_remaining/24).toFixed(1)}d</span>`;
@@ -999,7 +1012,7 @@ function renderActions(actions) {
 function renderZombies(zombies) {
   const body = document.getElementById('zombie-body');
   if (!zombies.length) {
-    body.innerHTML = '<div class="empty" style="color:var(--green)">✓ No zombies detected</div>';
+    body.innerHTML = '<div class="empty" style="color:var(--green);font-size:13px">✓ No zombies detected</div>';
     return;
   }
   body.innerHTML = zombies.map(z => {
@@ -1033,6 +1046,7 @@ function render(data) {
     document.getElementById('s-free-pct').textContent = fmt.pct(100 - s.utilisation_pct) + ' free';
     const freeEl = document.getElementById('s-free');
     freeEl.className = 'card-value ' + (free < 5000 ? 'red' : free < 20000 ? 'amber' : 'green');
+
   }
 
   // Economics

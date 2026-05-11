@@ -173,7 +173,6 @@ impl NetworkClient {
         let data = self.query(r#"{
           graphNetwork(id: "1") {
             totalTokensSignalled
-            issuancePerBlock
           }
         }"#, None).await?;
 

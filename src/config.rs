@@ -114,13 +114,13 @@ fn config_path() -> PathBuf {
 /// Write an example config. Used by `sik init`.
 pub fn example_config() -> &'static str {
     r#"[indexer]
-address = "0xb43B2CCCceadA5292732a8C58ae134AdEFcE09Bb"
-operator_address = "0xB70781305939A39e74Aa918416Df1b893e1Bd904"
+address = "0xYOUR_INDEXER_ADDRESS"
+operator_address = "0xYOUR_OPERATOR_ADDRESS"
 
 [server]
-host = "65.109.22.252"
+host = "YOUR_SERVER_IP"
 user = "root"
-ssh_key = "~/.ssh/id_ed25519_robotzner"
+ssh_key = "~/.ssh/id_ed25519"
 
 [docker]
 indexer_agent_container = "indexer-agent"
