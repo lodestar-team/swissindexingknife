@@ -43,22 +43,19 @@ pub async fn run(
     for d in candidates.iter().take(top * 2) {
         let ipfs_hash = d.ipfs_hash.clone();
 
-        // Chain filter: check manifest if --chain is specified
-        let graft = ipfs.graft_info(&ipfs_hash).await.ok().flatten();
+        let info = ipfs.manifest_info(&ipfs_hash).await;
 
-        // Check IPFS availability (we already fetched manifest, so if graft succeeded it's available)
-        let ipfs_ok = graft.is_some() || ipfs.is_available(&ipfs_hash).await;
-
-        // Filter by chain if specified
-        // (We'd need the manifest to get the chain — skip complex chain parsing for now,
-        //  but filter by simple subgraph name hints if chain arg is given)
+        // Chain filter: exact match against manifest's indexed network
         if let Some(ref c) = chain {
-            // Heuristic: if the user specifies "base", we look at the deployment names we know
-            // For a proper impl this would parse the manifest `network` field
-            // For now we skip this filter and let users review the output
-            let _ = c;
+            let matches = info.network.as_deref()
+                .map(|n| n.eq_ignore_ascii_case(c))
+                .unwrap_or(false);
+            if !matches {
+                continue;
+            }
         }
 
+        let graft = info.graft;
         let est = d.est_monthly_grt(alloc_grt, &net_stats);
         rows.push(DiscoverRow {
             ipfs_hash: ipfs_hash.clone(),
@@ -66,7 +63,8 @@ pub async fn run(
             staked: d.staked,
             ratio: d.ratio,
             denied_at: d.denied_at,
-            ipfs_ok,
+            ipfs_ok: info.accessible,
+            network: info.network,
             has_graft: graft.is_some(),
             graft_base: graft.map(|g| g.base_hash),
             est_monthly_at_proposed: est,
@@ -82,6 +80,7 @@ pub async fn run(
     if json {
         let out: Vec<_> = rows.iter().map(|r| serde_json::json!({
             "ipfs_hash": r.ipfs_hash,
+            "network": r.network,
             "signal_grt": r.signal.0,
             "staked_grt": r.staked.0,
             "ratio": r.ratio,
@@ -107,7 +106,7 @@ pub async fn run(
 
     let mut table = Table::new();
     table.load_preset(UTF8_BORDERS_ONLY);
-    table.set_header(["Rank", "Deployment", "Signal GRT", "Staked GRT", "Ratio", "IPFS", "Graft", &format!("Est GRT/mo @ {}K", proposed_alloc / 1000.0)]);
+    table.set_header(["Rank", "Deployment", "Network", "Signal GRT", "Staked GRT", "Ratio", "IPFS", "Graft", &format!("Est GRT/mo @ {}K", proposed_alloc / 1000.0)]);
 
     for (i, r) in rows.iter().enumerate() {
         let ipfs_str = if r.ipfs_ok { "yes".green().to_string() } else { "NO".red().to_string() };
@@ -116,9 +115,11 @@ pub async fn run(
         } else {
             "no".normal().to_string()
         };
+        let network_str = r.network.clone().unwrap_or_else(|| "?".into());
         table.add_row([
             &(i + 1).to_string(),
             &short_hash(&r.ipfs_hash),
+            &network_str,
             &fmt_comma(r.signal.0),
             &fmt_comma(r.staked.0),
             &fmt_ratio(r.ratio),
@@ -149,6 +150,7 @@ struct DiscoverRow {
     ratio: f64,
     denied_at: i64,
     ipfs_ok: bool,
+    network: Option<String>,
     has_graft: bool,
     graft_base: Option<String>,
     est_monthly_at_proposed: Grt,

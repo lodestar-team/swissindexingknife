@@ -50,6 +50,33 @@ impl IpfsClient {
         // Fall back to YAML parsing (basic string search)
         Ok(extract_graft_from_yaml(&content))
     }
+
+    /// Fetch and parse a manifest — returns accessibility, indexed chain, and graft info in one call.
+    /// Uses the same `specVersion:` gate as `sik verify` to avoid IPFS false positives.
+    pub async fn manifest_info(&self, ipfs_hash: &str) -> ManifestInfo {
+        let bytes = match self.cat(ipfs_hash).await {
+            Some(b) => b,
+            None => return ManifestInfo::inaccessible(),
+        };
+        let content = String::from_utf8_lossy(&bytes);
+
+        // Same gate as sik verify — must have specVersion to be a real manifest
+        if !content.contains("specVersion:") {
+            return ManifestInfo::inaccessible();
+        }
+
+        let graft = if let Ok(json) = serde_json::from_str::<Value>(&content) {
+            extract_graft_from_json(&json)
+        } else {
+            extract_graft_from_yaml(&content)
+        };
+
+        ManifestInfo {
+            accessible: true,
+            network: extract_network_from_yaml(&content),
+            graft,
+        }
+    }
 }
 
 fn extract_graft_from_json(v: &Value) -> Option<GraftInfo> {
@@ -94,4 +121,30 @@ pub struct GraftInfo {
     pub base_hash: String,
     /// Block number at which the graft occurs
     pub block: u64,
+}
+
+fn extract_network_from_yaml(content: &str) -> Option<String> {
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("network:") {
+            let val = trimmed["network:".len()..].trim().trim_matches('"').to_string();
+            if !val.is_empty() {
+                return Some(val);
+            }
+        }
+    }
+    None
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ManifestInfo {
+    pub accessible: bool,
+    pub network: Option<String>,
+    pub graft: Option<GraftInfo>,
+}
+
+impl ManifestInfo {
+    fn inaccessible() -> Self {
+        Self { accessible: false, network: None, graft: None }
+    }
 }

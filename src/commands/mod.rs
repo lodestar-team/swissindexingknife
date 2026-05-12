@@ -7,5 +7,8 @@ pub mod rule;
 pub mod thaw;
 pub mod pnl;
 pub mod actions;
+pub mod present_poi;
+pub mod bounty;
 pub mod context;
 pub mod serve;
+pub mod resize;

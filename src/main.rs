@@ -94,9 +94,40 @@ enum Commands {
         cmd: Option<ActionsCmd>,
     },
 
+    /// Present a Proof of Indexing (POI) for an allocation
+    PresentPoi {
+        /// IPFS hash of the deployment (Qm...)
+        deployment: String,
+        /// Allocation ID (0x address — from `sik allocations`)
+        allocation_id: String,
+        /// POI hash (omit for automatic/zero POI)
+        #[arg(long)]
+        poi: Option<String>,
+        /// Skip confirmation prompt
+        #[arg(long)]
+        yes: bool,
+    },
+
+    /// Bounty workflow: check status or present POI to claim rewards
+    Bounty {
+        #[command(subcommand)]
+        cmd: BountyCmd,
+    },
+
     /// Full context dump for AI agents (JSON only).
     /// Aggregates all state + recommendations in one call.
     Context,
+
+    /// Resize an active allocation to a new GRT amount
+    Resize {
+        /// IPFS hash of the deployment (Qm...)
+        deployment: String,
+        /// New allocation amount in GRT
+        amount: f64,
+        /// Skip confirmation prompt
+        #[arg(long)]
+        yes: bool,
+    },
 
     /// Launch the hacker-style web dashboard
     Serve {
@@ -129,11 +160,38 @@ enum RuleCmd {
 }
 
 #[derive(Subcommand)]
+enum BountyCmd {
+    /// Check bounty status: allocation open? synced? POI presented?
+    Status {
+        /// IPFS hash of the deployment
+        deployment: String,
+    },
+    /// Present POI and prepare to claim rewards (auto-resolves allocation ID)
+    Claim {
+        /// IPFS hash of the deployment
+        deployment: String,
+        /// POI hash (omit for automatic/zero POI)
+        #[arg(long)]
+        poi: Option<String>,
+        /// Skip confirmation prompt
+        #[arg(long)]
+        yes: bool,
+    },
+}
+
+#[derive(Subcommand)]
 enum ThawCmd {
     /// Withdraw matured thaws (requires indexer cold wallet key)
     Withdraw {
+        /// Skip confirmation prompt
         #[arg(long)]
         yes: bool,
+        /// Indexer cold wallet private key (alternative: INDEXER_COLD_WALLET_KEY env var)
+        #[arg(long)]
+        cold_wallet_key: Option<String>,
+        /// Arbitrum RPC URL (alternative: ARB_RPC_URL env var; defaults to public endpoint)
+        #[arg(long)]
+        rpc_url: Option<String>,
     },
 }
 
@@ -192,12 +250,8 @@ async fn main() -> Result<()> {
         Commands::Thaw { cmd } => {
             match cmd {
                 None => commands::thaw::run(&cfg, cli.json).await?,
-                Some(ThawCmd::Withdraw { yes }) => {
-                    if !yes {
-                        eprintln!("Add --yes to confirm withdrawal.");
-                    }
-                    eprintln!("On-chain withdrawal not yet implemented in sik — use cast directly.");
-                    commands::thaw::run(&cfg, cli.json).await?;
+                Some(ThawCmd::Withdraw { yes, cold_wallet_key, rpc_url }) => {
+                    commands::thaw::withdraw(&cfg, yes, cold_wallet_key, rpc_url).await?;
                 }
             }
         }
@@ -215,6 +269,23 @@ async fn main() -> Result<()> {
                     commands::actions::list(&cfg, status.as_deref(), cli.json).await?;
                 }
             }
+        }
+
+        Commands::PresentPoi { deployment, allocation_id, poi, yes } => {
+            commands::present_poi::run(&cfg, &deployment, &allocation_id, poi.as_deref(), yes).await?;
+        }
+
+        Commands::Bounty { cmd } => match cmd {
+            BountyCmd::Status { deployment } => {
+                commands::bounty::status(&cfg, &deployment, cli.json).await?;
+            }
+            BountyCmd::Claim { deployment, poi, yes } => {
+                commands::bounty::claim(&cfg, &deployment, poi.as_deref(), yes).await?;
+            }
+        },
+
+        Commands::Resize { deployment, amount, yes } => {
+            commands::resize::run(&cfg, &deployment, amount, yes).await?;
         }
 
         Commands::Context => {
