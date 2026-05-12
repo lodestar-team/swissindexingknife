@@ -2,6 +2,8 @@
 
 A CLI for Graph Protocol indexer operations. Wraps all known API quirks so you never have to remember them. Designed to be used directly by humans and AI agents alike.
 
+<img width="3024" height="1582" alt="image" src="https://github.com/user-attachments/assets/b1965d42-5410-42bf-9426-b2271ca7a6cc" />
+
 ## Install
 
 ```bash
