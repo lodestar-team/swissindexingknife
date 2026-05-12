@@ -119,7 +119,15 @@ impl ManagementClient {
           }}
         }}"#, filter = filter_arg);
 
-        let data = self.query(&gql).await?;
+        // QUIRK: management API returns "Cannot convert undefined or null to object"
+        // when the actions table is empty or in certain states. Treat as empty list.
+        let data = match self.query(&gql).await {
+            Ok(d) => d,
+            Err(e) if e.to_string().contains("Cannot convert undefined or null") => {
+                return Ok(vec![]);
+            }
+            Err(e) => return Err(e),
+        };
 
         let actions = match data["actions"].as_array() {
             Some(a) => a.clone(),
@@ -199,6 +207,92 @@ impl ManagementClient {
         let data = self.query(&mutation).await?;
         let id = data["queueActions"][0]["id"].as_i64().unwrap_or(-1);
         Ok(id)
+    }
+
+    /// Present a Proof of Indexing (POI) for a specific allocation.
+    /// QUIRK: amount is GRT (not wei) for queueActions.
+    /// QUIRK: status must be `approved` or it will sit indefinitely without executing.
+    /// If `poi` is None, sends the zero-hash (tells agent to compute automatically).
+    pub async fn queue_present_poi(
+        &self,
+        deployment_id: &str,
+        allocation_id: &str,
+        poi: Option<&str>,
+    ) -> Result<i64> {
+        let poi_val = poi.unwrap_or(
+            "0x0000000000000000000000000000000000000000000000000000000000000000"
+        );
+        let mutation = format!(r#"mutation {{
+          queueActions(actions: [{{
+            type: presentPOI
+            deploymentID: "{deployment}"
+            allocationID: "{allocation}"
+            poi: "{poi}"
+            status: approved
+            priority: 0
+            isLegacy: false
+            source: "sik"
+            reason: "manual via sik"
+          }}]) {{
+            id
+            status
+          }}
+        }}"#,
+            deployment = deployment_id,
+            allocation = allocation_id,
+            poi = poi_val,
+        );
+        let data = self.query(&mutation).await?;
+        let id = data["queueActions"][0]["id"].as_i64().unwrap_or(-1);
+        Ok(id)
+    }
+
+    /// Queue a resize action (queued state — caller must approve when capacity is free).
+    /// QUIRK: amount is GRT (not wei) for queueActions.
+    pub async fn queue_resize(
+        &self,
+        deployment_id: &str,
+        allocation_id: &str,
+        amount_grt: Grt,
+        protocol_network: &str,
+    ) -> Result<i64> {
+        let mutation = format!(r#"mutation {{
+          queueActions(actions: [{{
+            type: resize
+            deploymentID: "{deployment}"
+            allocationID: "{allocation}"
+            amount: "{amount}"
+            status: queued
+            priority: 0
+            isLegacy: false
+            source: "sik"
+            reason: "manual resize via sik"
+            protocolNetwork: "{network}"
+          }}]) {{
+            id
+            status
+          }}
+        }}"#,
+            deployment = deployment_id,
+            allocation = allocation_id,
+            amount = amount_grt.0,
+            network = protocol_network,
+        );
+        let data = self.query(&mutation).await?;
+        let id = data["queueActions"][0]["id"].as_i64().unwrap_or(-1);
+        Ok(id)
+    }
+
+    /// Provision additional GRT to SubgraphService (increases allocation capacity).
+    pub async fn add_to_provision(&self, amount_grt: Grt, protocol_network: &str) -> Result<()> {
+        let mutation = format!(r#"mutation {{
+          addToProvision(protocolNetwork: "{network}", amount: "{amount}")
+        }}"#,
+            network = protocol_network,
+            amount = amount_grt.0,
+        );
+        self.query(&mutation).await?;
+        Ok(())
     }
 
     /// Close an allocation.

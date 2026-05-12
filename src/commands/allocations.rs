@@ -45,6 +45,7 @@ pub async fn run(cfg: &Config, json: bool) -> Result<()> {
         };
 
         rows.push(AllocRow {
+            alloc_id: a.id.clone(),
             ipfs_hash: a.ipfs_hash.clone(),
             allocated: a.allocated_tokens,
             signal,
@@ -58,6 +59,7 @@ pub async fn run(cfg: &Config, json: bool) -> Result<()> {
 
     if json {
         let out: Vec<_> = rows.iter().map(|r| serde_json::json!({
+            "alloc_id": r.alloc_id,
             "ipfs_hash": r.ipfs_hash,
             "allocated_grt": r.allocated.0,
             "signal_grt": r.signal.map(|g| g.0),
@@ -82,7 +84,7 @@ pub async fn run(cfg: &Config, json: bool) -> Result<()> {
 
     let mut table = Table::new();
     table.load_preset(UTF8_BORDERS_ONLY);
-    table.set_header(["Deployment", "Alloc GRT", "Signal GRT", "Share%", "Ratio", "Est GRT/mo", "Est $/mo", "Sync"]);
+    table.set_header(["Alloc ID", "Deployment", "Alloc GRT", "Signal GRT", "Share%", "Ratio", "Est GRT/mo", "Est $/mo", "Sync"]);
 
     let mut total_alloc = 0.0f64;
     let mut total_monthly = 0.0f64;
@@ -92,6 +94,7 @@ pub async fn run(cfg: &Config, json: bool) -> Result<()> {
         if let Some((est, share)) = r.est_monthly {
             total_monthly += est.0;
             table.add_row([
+                &short_hash(&r.alloc_id),
                 &short_hash(&r.ipfs_hash),
                 &fmt_comma(r.allocated.0),
                 &fmt_comma(r.signal.map(|g| g.0).unwrap_or(0.0)),
@@ -103,6 +106,7 @@ pub async fn run(cfg: &Config, json: bool) -> Result<()> {
             ]);
         } else {
             table.add_row([
+                &short_hash(&r.alloc_id),
                 &short_hash(&r.ipfs_hash),
                 &fmt_comma(r.allocated.0),
                 "–", "–", "–", "–", "–",
@@ -124,6 +128,7 @@ pub async fn run(cfg: &Config, json: bool) -> Result<()> {
 use crate::types::Grt;
 
 struct AllocRow {
+    alloc_id: String,
     ipfs_hash: String,
     allocated: Grt,
     signal: Option<Grt>,

@@ -75,7 +75,9 @@ pub async fn set(
     }
     println!("  network:      {}", cfg.network.protocol_network);
 
-    if !yes {
+    // Skip prompt when --yes passed or stdin is not a terminal (e.g. scripted/piped).
+    let need_confirm = !yes && std::io::IsTerminal::is_terminal(&std::io::stdin());
+    if need_confirm {
         print!("\nProceed? [y/N] ");
         use std::io::Write;
         std::io::stdout().flush()?;

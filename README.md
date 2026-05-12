@@ -1,6 +1,8 @@
 # Swiss Indexing Knife (`sik`)
 
-A CLI for Graph Protocol indexer operations. Wraps all known API quirks so you never have to remember them. Designed to be used directly by humans and AI agents alike.
+A CLI for Graph Protocol indexer operations on [The Graph](https://thegraph.com/) protocol.
+Wraps all known API quirks so you never have to remember them.
+Works equally well for human operators and AI agents.
 
 <img width="3024" height="1582" alt="image" src="https://github.com/user-attachments/assets/b1965d42-5410-42bf-9426-b2271ca7a6cc" />
 
@@ -74,7 +76,7 @@ delegation_cut_bps = 1000   # 10%
 sik status                              # full human-readable status
 sik status --json                       # machine-readable (AI agent mode)
 
-sik allocations                         # efficiency table: signal/stake ratios, est rewards
+sik allocations                         # efficiency table: alloc IDs, signal/stake, est rewards
 sik discover --top 20 --alloc 100000    # find allocation opportunities
 sik verify <Qm...>                      # pre-flight check before allocating
 sik graft-status <Qm...>               # sync progress for a grafted deployment
@@ -90,6 +92,14 @@ sik rule list                           # indexing rules vs on-chain state
 sik rule set <Qm...> always --amount 100000   # allocate (GRT, not wei)
 sik rule set <Qm...> never              # stop allocating
 
+sik present-poi <Qm...> <0x...>        # present a POI for a specific allocation
+sik present-poi <Qm...> <0x...> --poi <0x...>  # with explicit POI hash
+sik present-poi <Qm...> <0x...> --yes  # skip confirmation
+
+sik bounty status <Qm...>              # check bounty eligibility: alloc open? synced? POI presented?
+sik bounty claim <Qm...>               # present POI and prepare to claim (auto-resolves alloc ID)
+sik bounty claim <Qm...> --yes         # skip confirmation
+
 sik context                             # AI situational-awareness dump (JSON)
 sik serve                               # live web dashboard on http://localhost:7777
 sik serve --port 8888 --open            # custom port + auto-open browser
@@ -98,6 +108,33 @@ sik init                                # print example config
 ```
 
 All commands support `--json` for structured output.
+
+## Bounty Workflow
+
+The complete bounty flow — deploy, allocate, sync, prove, claim — is tracked by `sik bounty`:
+
+```bash
+# 1. Check where you are in the flow
+sik bounty status QmVeyHjXi...
+#   Allocation:  ✓ open  107000 GRT  (ID: 0xabcd...ef12)
+#   Sync:        ✓ synced
+#   POI action:  – no presentPOI action found
+#   → Ready to claim! Run: sik bounty claim QmVeyHjXi...
+
+# 2. Present POI (looks up allocation ID automatically)
+sik bounty claim QmVeyHjXi...
+
+# 3. Verify the POI was accepted
+sik actions --status approved
+
+# 4. Claim on the dashboard once the agent has executed the action
+```
+
+If you already have the allocation ID (from `sik allocations`), you can also call `present-poi` directly:
+
+```bash
+sik present-poi QmVeyHjXi... 0xabcd...ef12
+```
 
 ## Live Dashboard
 
@@ -142,6 +179,8 @@ These quirks are baked into `sik`. You don't need to remember them unless you're
 | Queued actions don't execute — must be `approved` | Use `updateActions` mutation to approve |
 | graph-node containers lack curl | Route via indexer-agent container |
 | L2 network subgraph lacks `issuancePerBlock` | Monthly issuance is hardcoded |
+| Allocation IDs (0x...) not in `indexingRules` response | Read from `allocations` query instead |
+| `presentPOI` action requires `allocationID` field | `sik bounty claim` auto-resolves it |
 
 ## License
 
