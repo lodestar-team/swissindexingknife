@@ -13,8 +13,10 @@ use crate::client::{GraphNodeClient, ManagementClient, NetworkClient};
 use crate::config::Config;
 use crate::executor::RemoteExecutor;
 
-/// Tracks (latest_block, timestamp_secs) per subgraph for sync rate calculation.
-type SyncHistory = Arc<Mutex<HashMap<String, (u64, u64)>>>;
+/// Rolling window of (timestamp_secs, latest_block) samples per subgraph.
+/// Used for linear-regression sync-rate estimation.
+type SyncHistory = Arc<Mutex<HashMap<String, Vec<(u64, u64)>>>>;
+const SYNC_MAX_SAMPLES: usize = 120; // ~1 hour at 30 s polling
 
 #[derive(Clone)]
 struct AppState {
@@ -33,6 +35,7 @@ pub async fn run(cfg: Config, port: u16, open: bool) -> Result<()> {
         .route("/api/data", get(api_data))
         .route("/api/server", get(api_server))
         .route("/api/tap", get(api_tap))
+        .route("/api/dispatch", get(api_dispatch))
         .layer(CorsLayer::permissive())
         .with_state(state);
 
@@ -80,27 +83,30 @@ async fn api_data(State(state): State<AppState>) -> impl IntoResponse {
     let net_stats = net_stats_r.ok();
     let closed_allocs = closed_r.unwrap_or_default();
 
-    // ── Sync ETA computation ─────────────────────────────────────────────────
-    // Compare current block numbers against last-seen values to compute rate.
+    // ── Sync ETA computation (linear regression over rolling window) ──────────
     let now_secs = chrono::Utc::now().timestamp() as u64;
     let mut sync_rates_bph: HashMap<String, f64> = HashMap::new();
     let mut sync_eta_hours: HashMap<String, f64> = HashMap::new();
+    let mut sync_samples_map: HashMap<String, usize> = HashMap::new();
     {
         let mut history = state.sync_history.lock().unwrap();
         for s in &statuses {
             if s.synced || s.chain_head_block == 0 || s.latest_block == 0 { continue; }
-            if let Some((prev_block, prev_ts)) = history.get(&s.subgraph).copied() {
-                let elapsed = now_secs.saturating_sub(prev_ts);
-                if elapsed >= 10 && s.latest_block > prev_block {
-                    let bps = (s.latest_block - prev_block) as f64 / elapsed as f64;
-                    let bph = bps * 3600.0;
-                    let behind = s.chain_head_block.saturating_sub(s.latest_block) as f64;
-                    let eta_h = if bps > 0.0 { behind / bps / 3600.0 } else { f64::INFINITY };
-                    sync_rates_bph.insert(s.subgraph.clone(), bph);
-                    sync_eta_hours.insert(s.subgraph.clone(), eta_h);
+            let window = history.entry(s.subgraph.clone()).or_default();
+            // Only append if the block has advanced (avoid duplicate points)
+            if window.last().map(|&(_, b)| b < s.latest_block).unwrap_or(true) {
+                window.push((now_secs, s.latest_block));
+                if window.len() > SYNC_MAX_SAMPLES {
+                    window.remove(0);
                 }
             }
-            history.insert(s.subgraph.clone(), (s.latest_block, now_secs));
+            sync_samples_map.insert(s.subgraph.clone(), window.len());
+            if let Some(bps) = sync_regression_bps(window) {
+                let bph = bps * 3600.0;
+                let behind = s.chain_head_block.saturating_sub(s.latest_block) as f64;
+                sync_rates_bph.insert(s.subgraph.clone(), bph);
+                sync_eta_hours.insert(s.subgraph.clone(), behind / bps / 3600.0);
+            }
         }
     }
 
@@ -117,6 +123,7 @@ async fn api_data(State(state): State<AppState>) -> impl IntoResponse {
         });
         let eta_h = sync.and_then(|s| sync_eta_hours.get(&s.subgraph).copied());
         let rate_bph = sync.and_then(|s| sync_rates_bph.get(&s.subgraph).copied());
+        let samples = sync.and_then(|s| sync_samples_map.get(&s.subgraph).copied());
         let current_epoch = net_stats.as_ref().map(|ns| ns.current_epoch).unwrap_or(0);
         let epoch_age = if a.created_at_epoch > 0 && current_epoch > 0 {
             Some(current_epoch.saturating_sub(a.created_at_epoch as u64))
@@ -143,6 +150,7 @@ async fn api_data(State(state): State<AppState>) -> impl IntoResponse {
             "chain_head_block": sync.map(|s| s.chain_head_block),
             "sync_rate_bph": rate_bph,
             "sync_eta_hours": eta_h.map(|h| if h.is_finite() { h } else { -1.0 }),
+            "sync_samples": samples,
             "health": sync.map(|s| s.health.as_str()),
             "network": sync.map(|s| s.network.as_str()),
             "created_at_epoch": a.created_at_epoch,
@@ -260,6 +268,102 @@ async fn api_tap(State(state): State<AppState>) -> impl IntoResponse {
     Json(metrics)
 }
 
+async fn api_dispatch(State(state): State<AppState>) -> impl IntoResponse {
+    let cfg = &state.cfg;
+    let metrics = match &cfg.dispatch_server {
+        Some(srv) => collect_dispatch_metrics(srv).await,
+        None => serde_json::json!({ "error": "dispatch_server not configured" }),
+    };
+    Json(metrics)
+}
+
+async fn collect_dispatch_metrics(srv: &crate::config::ServerConfig) -> serde_json::Value {
+    let key = crate::executor::shellexpand_tilde(&srv.ssh_key);
+    let (system, dispatch) = tokio::join!(
+        ssh_server_metrics(&srv.host, &srv.user, &key),
+        collect_dispatch_db_metrics(&srv.host, &srv.user, &key),
+    );
+    let mut result = system;
+    result["dispatch"] = dispatch;
+    result
+}
+
+async fn collect_dispatch_db_metrics(host: &str, user: &str, key: &str) -> serde_json::Value {
+    // Queries in order; each returns exactly one row (COUNT/SUM always return a row).
+    // Final query returns N rows (one per chain): "chain_id|count"
+    let sql = "\
+SELECT COUNT(*) FROM tap_receipts WHERE timestamp_ns > ((EXTRACT(EPOCH FROM NOW())::bigint - 86400) * 1000000000);\n\
+SELECT COALESCE(SUM(value::numeric), 0)::text FROM tap_receipts WHERE timestamp_ns > ((EXTRACT(EPOCH FROM NOW())::bigint - 86400) * 1000000000);\n\
+SELECT COUNT(*) FROM tap_receipts WHERE timestamp_ns > ((EXTRACT(EPOCH FROM NOW())::bigint - 604800) * 1000000000);\n\
+SELECT COALESCE(SUM(value::numeric), 0)::text FROM tap_receipts WHERE timestamp_ns > ((EXTRACT(EPOCH FROM NOW())::bigint - 604800) * 1000000000);\n\
+SELECT COUNT(*) FROM tap_receipts WHERE timestamp_ns > ((EXTRACT(EPOCH FROM NOW())::bigint - 2592000) * 1000000000);\n\
+SELECT COALESCE(SUM(value::numeric), 0)::text FROM tap_receipts WHERE timestamp_ns > ((EXTRACT(EPOCH FROM NOW())::bigint - 2592000) * 1000000000);\n\
+SELECT COUNT(*) FROM tap_receipts;\n\
+SELECT COALESCE(SUM(value::numeric), 0)::text FROM tap_receipts;\n\
+SELECT COALESCE(SUM(value_aggregate::numeric), 0)::text FROM tap_ravs WHERE NOT redeemed;\n\
+SELECT COALESCE(SUM(value_aggregate::numeric), 0)::text FROM tap_ravs WHERE redeemed;\n\
+SELECT COUNT(DISTINCT payer_address) FROM tap_receipts;\n\
+SELECT chain_id::text || '|' || COUNT(*)::text FROM tap_receipts GROUP BY chain_id ORDER BY COUNT(*) DESC;\n";
+
+    use std::process::Stdio;
+    use tokio::io::AsyncWriteExt;
+
+    let Ok(mut child) = tokio::process::Command::new("ssh")
+        .args([
+            "-i", key,
+            "-o", "BatchMode=yes",
+            "-o", "StrictHostKeyChecking=accept-new",
+            "-o", "ConnectTimeout=8",
+            &format!("{}@{}", user, host),
+            "docker exec -i docker-postgres-1 psql -U dispatch -d dispatch -t -A 2>/dev/null",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn() else {
+            return serde_json::json!({ "error": "ssh spawn failed" });
+        };
+
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(sql.as_bytes()).await;
+    }
+
+    let Ok(out) = child.wait_with_output().await else {
+        return serde_json::json!({ "error": "ssh failed" });
+    };
+
+    parse_dispatch_db_output(&String::from_utf8_lossy(&out.stdout))
+}
+
+fn parse_dispatch_db_output(text: &str) -> serde_json::Value {
+    let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+    let wei_to_grt = |s: &str| -> f64 { s.trim().parse::<f64>().unwrap_or(0.0) / 1e18 };
+    let to_u64    = |s: &str| -> u64  { s.trim().parse::<u64>().unwrap_or(0) };
+
+    // Lines 0–10 are scalar metrics; lines 11+ are chain rows "chain_id|count"
+    let chains: Vec<serde_json::Value> = lines.iter().skip(11).filter_map(|l| {
+        let mut p = l.splitn(2, '|');
+        let chain = p.next()?.trim().parse::<u64>().ok()?;
+        let count = p.next()?.trim().parse::<u64>().ok()?;
+        Some(serde_json::json!({ "chain_id": chain, "requests": count }))
+    }).collect();
+
+    serde_json::json!({
+        "reqs_24h":         lines.get(0).map(|s| to_u64(s)).unwrap_or(0),
+        "fees_24h_grt":     lines.get(1).map(|s| wei_to_grt(s)).unwrap_or(0.0),
+        "reqs_7d":          lines.get(2).map(|s| to_u64(s)).unwrap_or(0),
+        "fees_7d_grt":      lines.get(3).map(|s| wei_to_grt(s)).unwrap_or(0.0),
+        "reqs_30d":         lines.get(4).map(|s| to_u64(s)).unwrap_or(0),
+        "fees_30d_grt":     lines.get(5).map(|s| wei_to_grt(s)).unwrap_or(0.0),
+        "reqs_total":       lines.get(6).map(|s| to_u64(s)).unwrap_or(0),
+        "fees_total_grt":   lines.get(7).map(|s| wei_to_grt(s)).unwrap_or(0.0),
+        "rav_pending_grt":  lines.get(8).map(|s| wei_to_grt(s)).unwrap_or(0.0),
+        "rav_redeemed_grt": lines.get(9).map(|s| wei_to_grt(s)).unwrap_or(0.0),
+        "unique_payers":    lines.get(10).map(|s| to_u64(s)).unwrap_or(0),
+        "chains": chains,
+    })
+}
+
 async fn collect_tap_metrics(cfg: &Config) -> serde_json::Value {
     let key = crate::executor::shellexpand_tilde(&cfg.server.ssh_key);
     let cmd = format!(
@@ -357,8 +461,32 @@ fn parse_prom_line(line: &str) -> Option<(HashMap<String, String>, &str)> {
     Some((labels, val))
 }
 
+/// Least-squares slope (blocks/sec) over a window of (timestamp_secs, block) samples.
+/// Returns None if there are fewer than 3 points or the block count is not advancing.
+fn sync_regression_bps(samples: &[(u64, u64)]) -> Option<f64> {
+    let n = samples.len();
+    if n < 3 { return None; }
+    let t0 = samples[0].0 as f64;
+    let (mut sx, mut sy, mut sxy, mut sxx) = (0f64, 0f64, 0f64, 0f64);
+    for &(t, b) in samples {
+        let x = t as f64 - t0;
+        let y = b as f64;
+        sx += x; sy += y; sxy += x * y; sxx += x * x;
+    }
+    let nf = n as f64;
+    let denom = nf * sxx - sx * sx;
+    if denom.abs() < 1e-9 { return None; }
+    let slope = (nf * sxy - sx * sy) / denom;
+    if slope <= 0.0 { return None; }
+    Some(slope)
+}
+
 async fn collect_server_metrics(cfg: &Config) -> serde_json::Value {
-    // SSH in and collect system metrics + docker container stats
+    let key = crate::executor::shellexpand_tilde(&cfg.server.ssh_key);
+    ssh_server_metrics(&cfg.server.host, &cfg.server.user, &key).await
+}
+
+async fn ssh_server_metrics(host: &str, user: &str, key: &str) -> serde_json::Value {
     let script = r#"
 printf 'LOADAVG:%s\n' "$(cat /proc/loadavg)"
 printf 'MEM:%s\n' "$(free -b | grep '^Mem:')"
@@ -370,16 +498,14 @@ docker ps --format '{"name":"{{.Names}}","status":"{{.Status}}","image":"{{.Imag
     let cmd = format!("bash -c '{}'", script.replace("'", "'\"'\"'"));
 
     use std::process::Stdio;
-    use tokio::io::AsyncWriteExt;
 
-    let key = crate::executor::shellexpand_tilde(&cfg.server.ssh_key);
     let result = tokio::process::Command::new("ssh")
         .args([
-            "-i", &key,
+            "-i", key,
             "-o", "BatchMode=yes",
             "-o", "StrictHostKeyChecking=accept-new",
             "-o", "ConnectTimeout=8",
-            &format!("{}@{}", cfg.server.user, cfg.server.host),
+            &format!("{}@{}", user, host),
             &cmd,
         ])
         .stdout(Stdio::piped())
@@ -391,7 +517,7 @@ docker ps --format '{"name":"{{.Names}}","status":"{{.Status}}","image":"{{.Imag
         Err(e) => serde_json::json!({ "error": e.to_string() }),
         Ok(out) => {
             let text = String::from_utf8_lossy(&out.stdout);
-            parse_server_metrics(&text, &cfg.server.host)
+            parse_server_metrics(&text, host)
         }
     }
 }
@@ -887,44 +1013,88 @@ canvas { max-height: 200px; }
       </div>
     </div>
 
-    <!-- Server metrics -->
-    <div class="panel">
-      <div class="panel-header">⚙ SERVER METRICS <span id="srv-host" class="val-dim" style="font-weight:400;font-size:10px"></span></div>
-      <div class="panel-body">
-        <div class="section-label" style="margin-bottom:10px">SYSTEM</div>
-        <div class="metric-row">
-          <div class="metric-name">CPU</div>
-          <div class="bar-wrap" style="flex:1">
-            <div class="bar"><div class="bar-fill" id="cpu-bar" style="width:0%"></div></div>
-            <div class="bar-label" id="cpu-val">—</div>
-          </div>
-        </div>
-        <div class="metric-row">
-          <div class="metric-name">RAM</div>
-          <div class="bar-wrap" style="flex:1">
-            <div class="bar"><div class="bar-fill" id="ram-bar" style="width:0%"></div></div>
-            <div class="bar-label" id="ram-val">—</div>
-          </div>
-        </div>
-        <div class="metric-row">
-          <div class="metric-name">DISK /</div>
-          <div class="bar-wrap" style="flex:1">
-            <div class="bar"><div class="bar-fill" id="disk-bar" style="width:0%"></div></div>
-            <div class="bar-label" id="disk-val">—</div>
-          </div>
-        </div>
-        <div class="metric-row">
-          <div class="metric-name">LOAD</div>
-          <div style="flex:1;color:var(--text);font-size:12px" id="load-val">—</div>
-        </div>
-        <div class="metric-row">
-          <div class="metric-name">UPTIME</div>
-          <div style="flex:1;color:var(--green);font-size:12px" id="uptime-val">—</div>
-        </div>
+    <!-- Server metrics column -->
+    <div style="display:flex;flex-direction:column;gap:12px;min-width:0">
 
-        <div class="section-label" style="margin-top:16px;margin-bottom:10px">CONTAINERS</div>
-        <div id="container-list"><div class="val-dim" style="font-size:10px">Loading...</div></div>
+      <!-- Subgraph server -->
+      <div class="panel">
+        <div class="panel-header">⚙ SUBGRAPH SERVER <span id="srv-host" class="val-dim" style="font-weight:400;font-size:10px"></span></div>
+        <div class="panel-body">
+          <div class="section-label" style="margin-bottom:10px">SYSTEM</div>
+          <div class="metric-row">
+            <div class="metric-name">CPU</div>
+            <div class="bar-wrap" style="flex:1">
+              <div class="bar"><div class="bar-fill" id="cpu-bar" style="width:0%"></div></div>
+              <div class="bar-label" id="cpu-val">—</div>
+            </div>
+          </div>
+          <div class="metric-row">
+            <div class="metric-name">RAM</div>
+            <div class="bar-wrap" style="flex:1">
+              <div class="bar"><div class="bar-fill" id="ram-bar" style="width:0%"></div></div>
+              <div class="bar-label" id="ram-val">—</div>
+            </div>
+          </div>
+          <div class="metric-row">
+            <div class="metric-name">DISK /</div>
+            <div class="bar-wrap" style="flex:1">
+              <div class="bar"><div class="bar-fill" id="disk-bar" style="width:0%"></div></div>
+              <div class="bar-label" id="disk-val">—</div>
+            </div>
+          </div>
+          <div class="metric-row">
+            <div class="metric-name">LOAD</div>
+            <div style="flex:1;color:var(--text);font-size:12px" id="load-val">—</div>
+          </div>
+          <div class="metric-row">
+            <div class="metric-name">UPTIME</div>
+            <div style="flex:1;color:var(--green);font-size:12px" id="uptime-val">—</div>
+          </div>
+          <div class="section-label" style="margin-top:16px;margin-bottom:10px">CONTAINERS</div>
+          <div id="container-list"><div class="val-dim" style="font-size:10px">Loading...</div></div>
+        </div>
       </div>
+
+      <!-- Dispatch server -->
+      <div class="panel">
+        <div class="panel-header">⚙ DISPATCH SERVER <span id="srv-host-d" class="val-dim" style="font-weight:400;font-size:10px"></span></div>
+        <div class="panel-body">
+          <div class="section-label" style="margin-bottom:10px">SYSTEM</div>
+          <div class="metric-row">
+            <div class="metric-name">CPU</div>
+            <div class="bar-wrap" style="flex:1">
+              <div class="bar"><div class="bar-fill" id="cpu-bar-d" style="width:0%"></div></div>
+              <div class="bar-label" id="cpu-val-d">—</div>
+            </div>
+          </div>
+          <div class="metric-row">
+            <div class="metric-name">RAM</div>
+            <div class="bar-wrap" style="flex:1">
+              <div class="bar"><div class="bar-fill" id="ram-bar-d" style="width:0%"></div></div>
+              <div class="bar-label" id="ram-val-d">—</div>
+            </div>
+          </div>
+          <div class="metric-row">
+            <div class="metric-name">DISK /</div>
+            <div class="bar-wrap" style="flex:1">
+              <div class="bar"><div class="bar-fill" id="disk-bar-d" style="width:0%"></div></div>
+              <div class="bar-label" id="disk-val-d">—</div>
+            </div>
+          </div>
+          <div class="metric-row">
+            <div class="metric-name">LOAD</div>
+            <div style="flex:1;color:var(--text);font-size:12px" id="load-val-d">—</div>
+          </div>
+          <div class="metric-row">
+            <div class="metric-name">UPTIME</div>
+            <div style="flex:1;color:var(--green);font-size:12px" id="uptime-val-d">—</div>
+          </div>
+          <div id="dispatch-stats"></div>
+          <div class="section-label" style="margin-top:16px;margin-bottom:10px">CONTAINERS</div>
+          <div id="container-list-d"><div class="val-dim" style="font-size:10px">Loading...</div></div>
+        </div>
+      </div>
+
     </div>
 
   </div>
@@ -1105,15 +1275,25 @@ function renderAllocations(allocs) {
     const network = a.network ? `<span class="val-dim">${a.network}</span>` : '';
 
     let etaStr = '—';
+    const samples = a.sync_samples ?? 0;
+    const rateBph = a.sync_rate_bph;
+    const rateStr = rateBph != null
+      ? `<div style="color:var(--dim);font-size:9px;margin-top:2px">${Math.round(rateBph).toLocaleString()} blk/h · ${samples}s</div>`
+      : '';
     if (synced) {
       etaStr = '<span style="color:var(--green)">synced</span>';
+    } else if (samples < 3) {
+      etaStr = '<span class="val-dim">measuring…</span>';
     } else if (a.sync_eta_hours != null && a.sync_eta_hours >= 0) {
       const h = a.sync_eta_hours;
-      if (h < 1) etaStr = `<span class="val-amber">~${Math.round(h*60)}m</span>`;
-      else if (h < 24) etaStr = `<span class="val-amber">~${h.toFixed(1)}h</span>`;
-      else etaStr = `<span class="val-dim">~${(h/24).toFixed(1)}d</span>`;
+      const conf = samples < 20 ? '<span class="val-dim" style="font-size:9px"> ?</span>' : '';
+      let etaVal;
+      if (h < 1) etaVal = `<span class="val-amber">~${Math.round(h*60)}m</span>`;
+      else if (h < 24) etaVal = `<span class="val-amber">~${h.toFixed(1)}h</span>`;
+      else etaVal = `<span class="val-dim">~${(h/24).toFixed(1)}d</span>`;
+      etaStr = etaVal + conf + rateStr;
     } else if (syncPct > 0 && !synced) {
-      etaStr = '<span class="val-dim">measuring…</span>';
+      etaStr = '<span class="val-dim">measuring…</span>' + rateStr;
     }
 
     return `<tr>
@@ -1161,44 +1341,44 @@ function renderAllocations(allocs) {
   charts.sync.update();
 }
 
-function renderServer(srv) {
+function renderServer(srv, sfx) {
+  sfx = sfx || '';
+  const cl = 'container-list' + sfx;
   if (!srv || srv.error) {
-    document.getElementById('container-list').innerHTML =
+    document.getElementById(cl).innerHTML =
       '<div class="val-dim" style="font-size:10px">' + (srv?.error || 'Unavailable') + '</div>';
     return;
   }
 
-  document.getElementById('srv-host').textContent = srv.host || '';
-  document.getElementById('uptime-val').textContent = srv.uptime || '—';
+  document.getElementById('srv-host' + sfx).textContent = srv.host || '';
+  document.getElementById('uptime-val' + sfx).textContent = srv.uptime || '—';
 
   if (srv.load) {
     const lp = srv.load_pct ?? 0;
-    setBar('cpu-bar', 'cpu-val', lp, `${lp.toFixed(0)}%  (${srv.load['1m'].toFixed(2)})`);
-    document.getElementById('load-val').textContent =
+    setBar('cpu-bar' + sfx, 'cpu-val' + sfx, lp, `${lp.toFixed(0)}%  (${srv.load['1m'].toFixed(2)})`);
+    document.getElementById('load-val' + sfx).textContent =
       `${srv.load['1m'].toFixed(2)}  ${srv.load['5m'].toFixed(2)}  ${srv.load['15m'].toFixed(2)}  (${srv.nproc} cores)`;
   }
   if (srv.mem) {
-    setBar('ram-bar', 'ram-val',
-      srv.mem.pct,
-      `${srv.mem.used_gb.toFixed(1)}/${srv.mem.total_gb.toFixed(0)} GB`
-    );
+    setBar('ram-bar' + sfx, 'ram-val' + sfx,
+      srv.mem.pct, `${srv.mem.used_gb.toFixed(1)}/${srv.mem.total_gb.toFixed(0)} GB`);
   }
   if (srv.disk) {
-    setBar('disk-bar', 'disk-val',
-      srv.disk.pct,
-      `${srv.disk.used_gb.toFixed(0)}/${srv.disk.total_gb.toFixed(0)} GB`
-    );
+    setBar('disk-bar' + sfx, 'disk-val' + sfx,
+      srv.disk.pct, `${srv.disk.used_gb.toFixed(0)}/${srv.disk.total_gb.toFixed(0)} GB`);
   }
+
+  if (srv.dispatch) renderDispatchStats(srv.dispatch);
 
   const containers = srv.containers || [];
   if (!containers.length) {
-    document.getElementById('container-list').innerHTML =
+    document.getElementById(cl).innerHTML =
       '<div class="val-dim" style="font-size:10px">No containers found</div>';
     return;
   }
 
-  // Key containers we care about
-  const priority = ['indexer-agent','indexer-service','indexer-tap-agent',
+  const priority = ['docker-dispatch-gateway-1','docker-dispatch-service-1',
+                    'indexer-agent','indexer-service','indexer-tap-agent',
                     'index-node-0','query-node-0','prometheus','grafana','subgraph-radio'];
 
   const sorted = [...containers].sort((a,b) => {
@@ -1208,7 +1388,7 @@ function renderServer(srv) {
     return ai - bi;
   });
 
-  document.getElementById('container-list').innerHTML = sorted.map(c => {
+  document.getElementById(cl).innerHTML = sorted.map(c => {
     const running = (c.status || '').toLowerCase().startsWith('up');
     const dotClass = running ? 'dot-green' : 'dot-red';
     const nameColor = running ? '' : 'style="color:var(--red)"';
@@ -1218,6 +1398,50 @@ function renderServer(srv) {
       <div class="ct-status">${c.status || '?'}</div>
     </div>`;
   }).join('');
+}
+
+function renderDispatchStats(d) {
+  const el = document.getElementById('dispatch-stats');
+  if (!el) return;
+  const grt6  = v => (v == null || v === 0) ? '<span class="val-dim">0</span>' : v.toFixed(6) + ' GRT';
+  const reqs  = v => v == null ? '—' : Number(v).toLocaleString();
+  const CHAIN_NAMES = {1:'ETH',42161:'ARB',8453:'BASE',56:'BNB',10:'OP',137:'POL'};
+
+  const chainRows = (d.chains || []).map(c => {
+    const name = CHAIN_NAMES[c.chain_id] || 'chain ' + c.chain_id;
+    return `<div class="metric-row" style="padding:4px 0">
+      <div class="metric-name">${name}</div>
+      <div class="val" style="flex:1;font-size:11px">${reqs(c.requests)} reqs</div>
+    </div>`;
+  }).join('');
+
+  el.innerHTML = `
+    <div class="section-label" style="margin-top:16px;margin-bottom:8px">DISPATCH REVENUE</div>
+    <table class="tbl" style="font-size:11px">
+      <thead><tr><th>PERIOD</th><th>REQUESTS</th><th>FEES GRT</th></tr></thead>
+      <tbody>
+        <tr><td class="val-dim">24h</td><td class="val">${reqs(d.reqs_24h)}</td><td class="val-gold">${grt6(d.fees_24h_grt)}</td></tr>
+        <tr><td class="val-dim">7d</td><td class="val">${reqs(d.reqs_7d)}</td><td class="val-gold">${grt6(d.fees_7d_grt)}</td></tr>
+        <tr><td class="val-dim">30d</td><td class="val">${reqs(d.reqs_30d)}</td><td class="val-gold">${grt6(d.fees_30d_grt)}</td></tr>
+        <tr><td class="val-dim">all</td><td class="val">${reqs(d.reqs_total)}</td><td class="val-gold">${grt6(d.fees_total_grt)}</td></tr>
+      </tbody>
+    </table>
+    <div style="margin-top:8px">
+      <div class="metric-row" style="padding:4px 0">
+        <div class="metric-name">PENDING</div>
+        <div class="val-amber" style="flex:1;font-size:11px">${grt6(d.rav_pending_grt)} <span class="val-dim">RAV</span></div>
+      </div>
+      <div class="metric-row" style="padding:4px 0">
+        <div class="metric-name">REDEEMED</div>
+        <div class="val-green" style="flex:1;font-size:11px">${grt6(d.rav_redeemed_grt)}</div>
+      </div>
+      <div class="metric-row" style="padding:4px 0">
+        <div class="metric-name">PAYERS</div>
+        <div class="val" style="flex:1;font-size:11px">${d.unique_payers ?? '—'}</div>
+      </div>
+    </div>
+    ${chainRows ? '<div class="section-label" style="margin-top:12px;margin-bottom:6px">BY CHAIN</div>' + chainRows : ''}
+  `;
 }
 
 function renderThaws(thaws) {
@@ -1442,10 +1666,19 @@ async function fetchServer() {
   try {
     const res = await fetch('/api/server');
     if (!res.ok) return;
-    const srv = await res.json();
-    renderServer(srv);
+    renderServer(await res.json(), '');
   } catch(e) {
-    renderServer({ error: e.message });
+    renderServer({ error: e.message }, '');
+  }
+}
+
+async function fetchDispatch() {
+  try {
+    const res = await fetch('/api/dispatch');
+    if (!res.ok) return;
+    renderServer(await res.json(), '-d');
+  } catch(e) {
+    renderServer({ error: e.message }, '-d');
   }
 }
 
@@ -1465,9 +1698,11 @@ initCharts();
 fetchData();
 fetchServer();
 fetchTap();
+fetchDispatch();
 setInterval(fetchData, 30000);
 setInterval(fetchServer, 60000);
 setInterval(fetchTap, 60000);
+setInterval(fetchDispatch, 60000);
 setInterval(updateTimestamp, 1000);
 </script>
 

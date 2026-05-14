@@ -12,6 +12,8 @@ pub struct Config {
     pub economics: EconomicsConfig,
     #[serde(default)]
     pub grt_price: GrtPriceConfig,
+    #[serde(default)]
+    pub dispatch_server: Option<ServerConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
